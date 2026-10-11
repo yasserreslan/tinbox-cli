@@ -8,6 +8,9 @@ server_dir=${TINBOX_SERVER_DIR:-$root/../tinbox}
 port=${TINBOX_E2E_PORT:-18190}
 url=http://127.0.0.1:$port
 : "${TINBOX_DB_URL:?set TINBOX_DB_URL to a Postgres the test may use}"
+# never launchd: its job name is the same for every HOME, so a test Mac's stop or logout would stop this Mac's own
+# tinbox; the agent runs as a plain process instead
+export TINBOX_NO_LAUNCHD=1
 work=$(mktemp -d /tmp/tin-test-tinbox-cli.XXXXXX)
 cd "$root" && ./tin build cli/main.tin -o bin/tinbox
 (cd "$server_dir" && ./tin build server/main.tin -o bin/tinbox)
@@ -132,7 +135,6 @@ A sync > /dev/null; B sync > /dev/null
 check "in the end both folders are the same" 'same'
 check "status renders" 'A status | grep -q "files"'
 # the background agent: it syncs by itself, shows in status, and tinbox stop leaves nothing running
-export TINBOX_NO_LAUNCHD=1
 A config set scan-interval 1s > /dev/null
 A start > /dev/null
 check "tinbox start runs the agent" 'A status | grep -Eq "running|syncing|up to date"'
@@ -145,7 +147,6 @@ pid=$(A status --json | sed 's/.*"pid":\([0-9]*\).*/\1/')
 A stop > /dev/null
 check "tinbox stop ends the agent" '! kill -0 "$pid" 2>/dev/null'
 check "status says stopped" 'A status | grep -q "stopped"'
-unset TINBOX_NO_LAUNCHD
 # signing out revokes the Mac
 B logout > /dev/null
 check "a signed-out Mac cannot sync" '! B sync > /dev/null 2>&1'
