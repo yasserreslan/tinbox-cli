@@ -1,0 +1,11 @@
+package agent
+
+import "crucible"
+import "twine"
+
+fn TestPlist(t mut crucible.T) {
+	let p = plist("/Users/a b/.local/bin/tinbox")
+	t.True("label", twine.Contains(p, "<string>dev.tinbox.agent</string>"))
+	t.True("program", twine.Contains(p, "<string>/Users/a b/.local/bin/tinbox</string><string>agent</string>"))
+	crucible.Equal(mut t, "escape", escape("a<&>b"), "a&lt;&amp;&gt;b")
+}

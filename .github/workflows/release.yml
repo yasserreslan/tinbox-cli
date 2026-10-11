@@ -1,0 +1,36 @@
+name: release
+
+# Tag a version (git tag v0.1.0 && git push origin v0.1.0) to publish it: binaries for Apple silicon and Linux, with
+# SHA256SUMS, which install.sh and tinbox update check.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/tinbox/tin
+          key: tin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('TIN_VERSION') }}
+      - name: Unit tests
+        run: scripts/test.sh
+      - name: Build
+        run: |
+          mkdir -p dist
+          ./tin build cli/main.tin -o dist/tinbox-darwin-arm64
+          ./tin build --target linux-arm64 cli/main.tin -o dist/tinbox-linux-arm64
+          ./tin build --target linux-amd64 cli/main.tin -o dist/tinbox-linux-amd64
+          (cd dist && shasum -a 256 tinbox-* > SHA256SUMS && cat SHA256SUMS)
+      - name: The tag matches the version in the code
+        run: test "v$(dist/tinbox-darwin-arm64 version | awk '{ print $2 }')" = "$GITHUB_REF_NAME"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --title "tinbox $GITHUB_REF_NAME" --notes "Install or update: \`curl -fsSL https://raw.githubusercontent.com/yasserreslan/tinbox-cli/main/install.sh | sh\`"

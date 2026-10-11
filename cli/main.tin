@@ -1,0 +1,1147 @@
+package main
+
+import "../proto"
+import "./agent"
+import "./api"
+import "./engine"
+import "./home"
+import "./local"
+import "./settings"
+import "./ui"
+import "argo"
+import "fault"
+import "flume"
+import "mint"
+import "quarry"
+import "say"
+import "seal"
+import "spawn"
+import "tide"
+import "tty"
+import "twine"
+import "wire"
+
+// tinbox: sync a folder on this Mac with a tinbox server (README.md). Commands sign in, link folders to teams, and
+// start or stop the background agent that keeps them in sync.
+
+const version = "0.1.0"
+
+const repo = "yasserreslan/tinbox-cli"
+
+// Args is the command line: the command, its words, and its flags (--name value, or --switch as "true").
+type Args struct {
+	Command str
+	Words   []str
+	Flags   map[str]str
+}
+
+fn valued(flag str) bool {
+	return flag == "--invite" || flag == "--name" || flag == "--team" || flag == "--role" || flag == "--rev" || flag == "-n"
+}
+
+fn parse(argv []str) !Args {
+	mut a = Args{Command: "", Words: []str{}, Flags: map[str]str{}}
+	mut i = 1
+	for i < len(argv) {
+		let w = argv[i]
+		if twine.HasPrefix(w, "-") && len(w) > 1 {
+			if valued(w) {
+				if i + 1 >= len(argv) {
+					fail "{w} needs a value"
+				}
+				a.Flags[w] = argv[i + 1]
+				i += 2
+				continue
+			}
+			a.Flags[w] = "true"
+			i += 1
+			continue
+		}
+		if len(a.Command) == 0 {
+			a.Command = w
+		} else {
+			a.Words = append(a.Words, w)
+		}
+		i += 1
+	}
+	return a
+}
+
+fn flag(a Args, name str) bool {
+	return a.Flags[name] == "true"
+}
+
+fn out(s str) {
+	say.Line(s)
+}
+
+// ask prints a question and reads one line of the answer.
+fn ask(question str) str {
+	say.Text(question)
+	mut r = flume.New(0)
+	let (line, _, err) = r.Line()
+	if err != nil {
+		return ""
+	}
+	return twine.TrimSpace(line)
+}
+
+fn yes(question str) bool {
+	let a = twine.ToLower(ask(question + " [y/N] "))
+	return a == "y" || a == "yes"
+}
+
+// deviceName is this Mac's name, as System Settings shows it.
+fn deviceName() str {
+	let r = spawn.Run(spawn.Cmd{Argv: []str{"/usr/sbin/scutil", "--get", "ComputerName"}, Env: spawn.Env.Inherit, Dir: "", Stdin: spawn.Stdio.Null, Stdout: spawn.Stdio.Pipe, Stderr: spawn.Stdio.Null, MaxOutput: 0, Input: ""}) catch _ {
+		spawn.Result{Code: 1, Stdout: "", Stderr: ""}
+	}
+	let n = twine.TrimSpace(r.Stdout)
+	if r.Code == 0 && len(n) > 0 {
+		return n
+	}
+	let h = quarry.Hostname() catch _ {
+		"this computer"
+	}
+	return h
+}
+
+fn client() !api.Client {
+	let c = try home.MustCredentials()
+	return try api.FromCredentials(c)
+}
+
+fn cwd() !str {
+	let wd = try quarry.Getwd()
+	return try home.Absolute(wd)
+}
+
+// here is the linked folder the working directory is in.
+fn here() !home.Folder {
+	let wd = try cwd()
+	let fs = try home.LoadFolders()
+	let f = home.FolderOf(fs, wd)
+	if f == nil {
+		fail "{home.Tilde(wd)} is not in a linked folder: run tinbox init in the folder to sync"
+	}
+	return f
+}
+
+fn hereOrNil() ?home.Folder {
+	let f = here() catch _ {
+		return nil
+	}
+	return f
+}
+
+fn findTeam(c mut api.Client, name str) !api.TeamOut {
+	let me = try api.Me(mut c)
+	if len(me.Teams) == 0 {
+		fail "you are in no team yet: tinbox team create NAME, or ask an owner for an invite"
+	}
+	if len(name) > 0 {
+		for t in me.Teams {
+			if twine.ToLower(t.Name) == twine.ToLower(name) {
+				return t
+			}
+		}
+		fail "you are in no team named {name:q}: tinbox teams lists yours"
+	}
+	if len(me.Teams) == 1 {
+		return me.Teams[0]
+	}
+	out("Which team?")
+	for i, t in me.Teams {
+		out("  {i + 1}  {t.Name}" + ui.Dim("  ({t.Role})"))
+	}
+	let pick = mint.Atoi(ask("Number: ")) catch _ {
+		0
+	}
+	if pick < 1 || pick > len(me.Teams) {
+		fail "no team picked"
+	}
+	return me.Teams[pick - 1]
+}
+
+fn teamOf(a Args, c mut api.Client) !api.TeamOut {
+	mut name = a.Flags["--team"]
+	if len(name) == 0 {
+		let f = hereOrNil()
+		if f != nil {
+			name = f.TeamName
+		}
+	}
+	return try findTeam(mut c, name)
+}
+
+// ---- signing in and out ----
+
+fn normalizeServer(raw str) str {
+	mut s = twine.TrimSpace(raw)
+	if !twine.HasPrefix(s, "http://") && !twine.HasPrefix(s, "https://") {
+		s = "https://" + s
+	}
+	return twine.TrimRight(s, "/")
+}
+
+// AcceptIn, LinkIn and CodeIn are the bodies a new key sends.
+type AcceptIn struct {
+	@json("code") Code str
+	@json("name") Name str
+	@json("device_name") DeviceName str
+	@json("public_key") PublicKey str
+}
+
+type LinkIn struct {
+	@json("device_name") DeviceName str
+	@json("public_key") PublicKey str
+}
+
+type CodeIn struct {
+	@json("code") Code str
+	@json("public_key") PublicKey str
+}
+
+fn save(server str, seed []u8, j api.Joined, name str) ! {
+	try home.SaveCredentials(home.Credentials{Server: server, Device: j.Device, DeviceName: name, User: j.User.Id, Email: j.User.Email, Name: j.User.Name, Seed: seal.B64(seed)})
+}
+
+fn login(a Args) ! {
+	let have = try home.LoadCredentials()
+	if have != nil {
+		fail "already signed in as {have.Email} on {have.Server}: tinbox logout first"
+	}
+	mut raw = ""
+	if len(a.Words) > 0 {
+		raw = a.Words[0]
+	} else {
+		raw = ask("Server URL: ")
+	}
+	if len(raw) == 0 {
+		fail "usage: tinbox login SERVER_URL [--invite CODE]"
+	}
+	let server = normalizeServer(raw)
+	let seed = api.NewSeed()
+	let pub = try api.PublicKey(seed)
+	mut c = api.New(server, "new", seed)
+	mut name = a.Flags["--name"]
+	if len(name) == 0 {
+		name = deviceName()
+	}
+	mut code = a.Flags["--invite"]
+	if len(code) == 0 && !flag(a, "--link") {
+		code = ask("Invite code " + ui.Dim("(press Enter to approve this Mac from another one instead)") + ": ")
+	}
+	mut j = api.Joined{User: api.UserOut{Id: 0, Email: "", Name: ""}, Device: 0, Team: 0, Role: ""}
+	if len(code) > 0 {
+		try api.Call(mut c, "POST", "/v1/invites/accept", api.Encode(AcceptIn{Code: code, Name: "", DeviceName: name, PublicKey: pub}), mut j)
+	} else {
+		mut lc = api.CodeOut{Code: "", ExpiresIn: 0}
+		try api.Call(mut c, "POST", "/v1/links", api.Encode(LinkIn{DeviceName: name, PublicKey: pub}), mut lc)
+		out("")
+		out("  On a Mac that is already signed in, run:")
+		out("")
+		out("    " + ui.Bold("tinbox approve " + lc.Code))
+		out("")
+		out(ui.Dim("  Waiting for the approval (the code lasts {lc.ExpiresIn / 60} minutes)…"))
+		let deadline = tide.Now() + lc.ExpiresIn * tide.Second
+		mut done = false
+		for !done && tide.Now() < deadline {
+			tide.Sleep(2 * tide.Second)
+			api.Call(mut c, "POST", "/v1/links/claim", api.Encode(CodeIn{Code: lc.Code, PublicKey: pub}), mut j) catch err {
+				if fault.Is(err, proto.ErrConflict) {
+					continue
+				}
+				fail err
+			}
+			done = true
+		}
+		if !done {
+			fail "the code expired before it was approved: run tinbox login again"
+		}
+	}
+	try save(server, seed, j, name)
+	out(ui.Ok("signed in as " + ui.Bold(j.User.Email) + " on " + name))
+	out(ui.Info("next: cd into the folder to sync and run tinbox init"))
+}
+
+fn logout(a Args) ! {
+	let creds = try home.MustCredentials()
+	mut c = try api.FromCredentials(creds)
+	let (_, revokeErr) = c.Raw("DELETE", "/v1/devices/{creds.Device}", "", "application/json")
+	if revokeErr != nil {
+		out(ui.Warn("could not reach the server to revoke this Mac: " + fault.Message(revokeErr)))
+	}
+	_ = try agent.Stop()
+	try home.RemoveCredentials()
+	out(ui.Ok("signed out: this Mac's key is revoked and removed"))
+	out(ui.Info("linked folders stay as they are, and sync again after tinbox login"))
+}
+
+fn whoami(a Args) ! {
+	let creds = try home.MustCredentials()
+	mut c = try api.FromCredentials(creds)
+	let me = try api.Me(mut c)
+	out("")
+	out(ui.Row(2, ui.Dim("user     ") + ui.Bold(me.User.Email), ui.Dim(me.User.Name)))
+	out(ui.Row(2, ui.Dim("this Mac ") + creds.DeviceName, ui.Dim("device {creds.Device}")))
+	out(ui.Row(2, ui.Dim("server   ") + creds.Server, ui.Dim("{c.LastMs} ms")))
+	out("")
+	for t in me.Teams {
+		out(ui.Row(2, ui.Dim("team     ") + t.Name, ui.Dim(t.Role)))
+	}
+	out("")
+}
+
+fn approve(a Args) ! {
+	if len(a.Words) != 1 {
+		fail "usage: tinbox approve CODE (the code the new Mac shows)"
+	}
+	mut c = try client()
+	mut o = api.ApprovedOut{DeviceName: ""}
+	try api.Call(mut c, "POST", "/v1/links/approve", api.Encode(CodeIn{Code: a.Words[0], PublicKey: ""}), mut o)
+	out(ui.Ok("approved " + ui.Bold(o.DeviceName) + ": it finishes signing in by itself"))
+}
+
+fn devices(a Args) ! {
+	mut c = try client()
+	if len(a.Words) == 2 && a.Words[0] == "revoke" {
+		let id = try mint.Atoi(a.Words[1]) wrap "a device id"
+		mut o = api.OkOut{Ok: false}
+		try api.Call(mut c, "DELETE", "/v1/devices/{id}", "", mut o)
+		out(ui.Ok("revoked device {id}"))
+		return
+	}
+	let me = try api.Me(mut c)
+	out("")
+	for d in me.Devices {
+		mut mark = "  "
+		if d.Current {
+			mark = ui.Green("● ")
+		}
+		out(ui.Row(2, mark + d.Name + ui.Dim("  #{d.Id}"), ui.Dim("seen " + ui.Ago(d.LastSeen))))
+	}
+	out("")
+	out(ui.Info("tinbox devices revoke ID removes one"))
+}
+
+// ---- teams ----
+
+fn teams(a Args) ! {
+	mut c = try client()
+	let me = try api.Me(mut c)
+	let fs = try home.LoadFolders()
+	out("")
+	for t in me.Teams {
+		mut where = ui.Dim("not synced on this Mac")
+		for f in fs.Folders {
+			if f.Team == t.Id {
+				where = home.Tilde(f.Path)
+			}
+		}
+		out(ui.Row(2, ui.Bold(t.Name) + ui.Dim("  " + t.Role), where))
+	}
+	if len(me.Teams) == 0 {
+		out(ui.Info("no teams yet: tinbox team create NAME"))
+	}
+	out("")
+}
+
+// TeamIn and InviteIn are request bodies.
+type TeamIn struct {
+	@json("name") Name str
+}
+
+type InviteIn struct {
+	@json("email") Email str
+	@json("role") Role str
+}
+
+fn team(a Args) ! {
+	if len(a.Words) != 2 || a.Words[0] != "create" {
+		fail "usage: tinbox team create NAME"
+	}
+	mut c = try client()
+	mut t = api.TeamOut{Id: 0, Name: "", Role: "", Root: 0}
+	try api.Call(mut c, "POST", "/v1/teams", api.Encode(TeamIn{Name: a.Words[1]}), mut t)
+	out(ui.Ok("made team " + ui.Bold(t.Name) + ": invite people with tinbox invite EMAIL --team " + t.Name))
+}
+
+fn invite(a Args) ! {
+	if len(a.Words) != 1 {
+		fail "usage: tinbox invite EMAIL [--team NAME] [--role member|owner]"
+	}
+	let creds = try home.MustCredentials()
+	mut c = try api.FromCredentials(creds)
+	let t = try teamOf(a, mut c)
+	mut role = a.Flags["--role"]
+	if len(role) == 0 {
+		role = "member"
+	}
+	mut o = api.CodeOut{Code: "", ExpiresIn: 0}
+	try api.Call(mut c, "POST", "/v1/teams/{t.Id}/invites", api.Encode(InviteIn{Email: a.Words[0], Role: role}), mut o)
+	out(ui.Ok("invite for {a.Words[0]} to {t.Name} as {role}, valid {o.ExpiresIn / 86400} days:"))
+	out("")
+	out("    " + ui.Bold(o.Code))
+	out("")
+	out(ui.Info("they install tinbox and run:  tinbox login {creds.Server} --invite {o.Code}"))
+}
+
+fn members(a Args) ! {
+	mut c = try client()
+	let t = try teamOf(a, mut c)
+	mut o = api.MembersOut{Members: []api.MemberOut{}}
+	try api.Call(mut c, "GET", "/v1/teams/{t.Id}/members", "", mut o)
+	out("")
+	out(ui.Info("team " + t.Name))
+	for m in o.Members {
+		out(ui.Row(2, m.User.Email, ui.Dim(m.Role)))
+	}
+	out("")
+}
+
+// ---- folders ----
+
+fn init(a Args) ! {
+	let creds = try home.MustCredentials()
+	mut c = try api.FromCredentials(creds)
+	let wd = try cwd()
+	let h = quarry.Getenv("HOME")
+	if wd == "/" || wd == h || wd == h + "/Desktop" || wd == h + "/Documents" || wd == h + "/Library" || home.Within(h + "/Library", wd) {
+		fail "sync a folder of its own, such as ~/Tinbox, not {home.Tilde(wd)}"
+	}
+	mut fs = try home.LoadFolders()
+	let inside = home.FolderOf(fs, wd)
+	if inside != nil {
+		fail "{home.Tilde(inside.Path)} is linked already (team {inside.TeamName})"
+	}
+	for f in fs.Folders {
+		if home.Within(wd, f.Path) {
+			fail "{home.Tilde(f.Path)} inside this folder is linked already"
+		}
+	}
+	let t = try teamOf(a, mut c)
+	for f in fs.Folders {
+		if f.Team == t.Id {
+			fail "team {t.Name} syncs at {home.Tilde(f.Path)} on this Mac already: one folder per team"
+		}
+	}
+	let (inode, dev) = try local.RootID(wd)
+	try engine.Save(wd, engine.Fresh(creds.Server, t.Id, t.Name, inode, dev))
+	fs.Folders = append(fs.Folders, home.Folder{Path: wd, Team: t.Id, TeamName: t.Name, Paused: false})
+	try home.SaveFolders(fs)
+	out(ui.Ok("linked " + ui.Bold(home.Tilde(wd)) + " to team " + ui.Bold(t.Name)))
+	out(ui.Info("the first sync uploads what is here and downloads what is there, and deletes nothing"))
+	if flag(a, "--no-start") {
+		out(ui.Info("tinbox sync syncs it now; tinbox start keeps it syncing"))
+		return
+	}
+	if !agent.Running() {
+		try agent.Start()
+	}
+	out(ui.Info("syncing in the background: Ctrl-C closes this view, syncing goes on (tinbox stop ends it)"))
+	try watch(wd, tty.IsTerminal(1))
+}
+
+fn unlink(a Args) ! {
+	let f = try here()
+	mut fs = try home.LoadFolders()
+	mut kept = []home.Folder{}
+	for x in fs.Folders {
+		if x.Path != f.Path {
+			kept = append(kept, x)
+		}
+	}
+	fs.Folders = kept
+	try home.SaveFolders(fs)
+	try quarry.RemoveAll(engine.Dir(f.Path))
+	out(ui.Ok("unlinked " + home.Tilde(f.Path) + ": its files stay here and on the server"))
+}
+
+fn sync(a Args) ! {
+	let f = try here()
+	if agent.Running() {
+		fail "the background agent syncs this folder already: tinbox status shows it (tinbox stop, then tinbox sync, to sync by hand)"
+	}
+	let creds = try home.MustCredentials()
+	mut c = try api.FromCredentials(creds)
+	let conf = try settings.Load(f.Path)
+	let opts = engine.Options{Confirm: flag(a, "--confirm-deletes"), Device: creds.DeviceName, Echo: true}
+	mut rep = try engine.Cycle(f.Path, mut c, conf, opts)
+	mut up = rep.Uploaded
+	mut down = rep.Downloaded
+	mut deleted = rep.DeletedHere + rep.DeletedThere
+	mut conflicts = rep.Conflicts
+	// a cycle that changed something is followed by another, which sends what the first one made (conflicted copies)
+	// and checks the result against the server
+	mut passes = 1
+	for passes < 4 && !rep.Verified && (rep.Uploaded + rep.Downloaded + rep.DeletedHere + rep.DeletedThere > 0 || len(rep.Conflicts) > 0) {
+		rep = try engine.Cycle(f.Path, mut c, conf, opts)
+		up += rep.Uploaded
+		down += rep.Downloaded
+		deleted += rep.DeletedHere + rep.DeletedThere
+		for x in rep.Conflicts {
+			conflicts = append(conflicts, x)
+		}
+		passes += 1
+	}
+	mut parts = []str{}
+	parts = append(parts, "{up} up")
+	parts = append(parts, "{down} down")
+	parts = append(parts, "{deleted} deleted")
+	mut tail = ""
+	if rep.Verified {
+		tail = ui.Dim(" · ") + ui.Green("✓") + " matches the server"
+	}
+	out(ui.Ok("synced " + home.Tilde(f.Path) + ": " + twine.Join(parts, ", ") + ui.Dim(" · {ui.Count(rep.Files)} files · {ui.Size(rep.Bytes)}") + tail))
+	for x in conflicts {
+		out(ui.Warn("conflict: kept your version as " + x))
+	}
+	if len(rep.Skipped) > 0 {
+		out(ui.Warn(ui.Plural(len(rep.Skipped), "file", "files") + " over the size limit not uploaded (tinbox status --skipped)"))
+	}
+	for e in rep.Errors {
+		out(ui.Warn(e))
+	}
+}
+
+// ---- status ----
+
+fn limits(folder str) ui.Limits {
+	let up = settings.Value("upload-limit", folder) catch _ {
+		"?"
+	}
+	let size = settings.Value("max-file-size", folder) catch _ {
+		"?"
+	}
+	let scan = settings.Value("scan-interval", folder) catch _ {
+		"?"
+	}
+	mut upload = up
+	if up == "0" {
+		upload = "unlimited"
+	}
+	mut maxFile = size
+	if size == "0" {
+		maxFile = "any size"
+	}
+	return ui.Limits{Upload: upload, MaxFile: maxFile, Scan: scan}
+}
+
+fn current() agent.Status {
+	if agent.Running() {
+		let s = agent.ReadStatus()
+		if s != nil {
+			mut live = s
+			agent.Live(mut live)
+			return live
+		}
+	}
+	return agent.Snapshot()
+}
+
+fn view(only str) str {
+	let running = agent.Running()
+	let creds = home.LoadCredentials() catch _ {
+		nil
+	}
+	return ui.Status(current(), running, creds, limits(only), only)
+}
+
+fn watch(only str, live bool) ! {
+	if !live {
+		out(view(only))
+		return
+	}
+	for {
+		arena {
+			let screen = view(only)
+			say.Text("\x1b[H\x1b[2J" + screen + "\n" + ui.Dim("  Ctrl-C closes this view; syncing goes on in the background") + "\n")
+		}
+		tide.Sleep(tide.Second)
+	}
+}
+
+fn status(a Args) ! {
+	let f = hereOrNil()
+	mut only = ""
+	if f != nil {
+		only = f.Path
+	}
+	if flag(a, "--json") {
+		mut b = make([]u8, 0, 4096)
+		argo.Put(mut b, current())
+		out(str(b))
+		return
+	}
+	if flag(a, "--skipped") {
+		let s = current()
+		out("")
+		for x in s.Folders {
+			if len(only) > 0 && x.Path != only {
+				continue
+			}
+			for p in x.Skipped {
+				let info = quarry.Stat(x.Path + "/" + p) catch _ {
+					quarry.FileInfo{Type: quarry.FileType.Regular, Perm: 0, Size: 0, Mtime: 0, Ctime: 0, Inode: 0, Device: 0, Links: 0}
+				}
+				out(ui.Row(2, ui.Yellow("⚠ ") + home.Tilde(x.Path + "/" + p), ui.Dim(ui.Size(info.Size))))
+			}
+		}
+		out("")
+		out(ui.Info("raise the limit with tinbox config set max-file-size 10MB"))
+		return
+	}
+	if flag(a, "--watch") {
+		try watch(only, tty.IsTerminal(1))
+		return
+	}
+	out(view(only))
+	if len(only) > 0 {
+		let lines = try recent(only, 5)
+		if len(lines) > 0 {
+			out(ui.Info("recent"))
+			for l in lines {
+				out(l)
+			}
+			out("")
+		}
+	}
+}
+
+// recent is the last n activity lines of a folder ("" for every folder), formatted.
+fn recent(folder str, n i64) ![]str {
+	let p = home.ActivityPath()
+	if !quarry.Exists(p) {
+		return []str{}
+	}
+	let text = try quarry.ReadFileBound(p, 67108864)
+	let lines = twine.Split(twine.TrimRight(text, "\n"), "\n")
+	mut picked = []str{}
+	mut i = len(lines) - 1
+	for i >= 0 && len(picked) < n {
+		let fields = twine.Split(lines[i], "\t")
+		i -= 1
+		if len(fields) != 4 || (len(folder) > 0 && fields[1] != folder) {
+			continue
+		}
+		let at = mint.Atoi(fields[0]) catch _ {
+			0
+		}
+		let when = tide.Format(at * tide.Second, tide.Local(), "Jan 2 15:04")
+		let mark = match fields[2] {
+			"↑" => ui.Blue("↑")
+			"↓" => ui.Green("↓")
+			"!" => ui.Yellow("!")
+			_ => ui.Red("×")
+		}
+		mut where = fields[3]
+		if len(folder) == 0 {
+			where = home.Tilde(fields[1] + "/" + fields[3])
+		}
+		picked = append(picked, "  " + ui.Dim(when) + "  " + mark + "  " + where)
+	}
+	mut ordered = []str{}
+	mut j = len(picked) - 1
+	for j >= 0 {
+		ordered = append(ordered, picked[j])
+		j -= 1
+	}
+	return ordered
+}
+
+fn log(a Args) ! {
+	let f = hereOrNil()
+	mut folder = ""
+	if f != nil {
+		folder = f.Path
+	}
+	mut n = 20
+	if len(a.Flags["-n"]) > 0 {
+		n = try mint.Atoi(a.Flags["-n"]) wrap "-n"
+	}
+	let lines = try recent(folder, n)
+	if len(lines) == 0 {
+		out(ui.Info("nothing synced yet"))
+		return
+	}
+	for l in lines {
+		out(l)
+	}
+}
+
+// ---- the agent ----
+
+fn start(a Args) ! {
+	_ = try home.MustCredentials()
+	let fs = try home.LoadFolders()
+	if len(fs.Folders) == 0 {
+		fail "no folder is linked yet: cd into one and run tinbox init"
+	}
+	if agent.Running() {
+		out(ui.Ok("already syncing " + ui.Plural(len(fs.Folders), "folder", "folders") + " in the background"))
+		return
+	}
+	try agent.Start()
+	out(ui.Ok("syncing " + ui.Plural(len(fs.Folders), "folder", "folders") + " in the background, now and at every login"))
+	out(ui.Info("tinbox status shows it; tinbox stop turns it off"))
+}
+
+fn stop(a Args) ! {
+	let fs = try home.LoadFolders()
+	let was = try agent.Stop()
+	if was {
+		out(ui.Ok("stopped syncing " + ui.Plural(len(fs.Folders), "folder", "folders")))
+	} else {
+		out(ui.Ok("tinbox was not running"))
+	}
+	out(ui.Ok("removed the login item: nothing from tinbox is running"))
+	out(ui.Info("run tinbox start to turn it back on"))
+}
+
+fn pause(a Args, paused bool) ! {
+	mut fs = try home.LoadFolders()
+	if flag(a, "--folder") {
+		let f = try here()
+		for i in 0..len(fs.Folders) {
+			if fs.Folders[i].Path == f.Path {
+				fs.Folders[i].Paused = paused
+			}
+		}
+		try home.SaveFolders(fs)
+		if paused {
+			out(ui.Ok("paused " + home.Tilde(f.Path)))
+		} else {
+			out(ui.Ok("resumed " + home.Tilde(f.Path)))
+		}
+		return
+	}
+	fs.Paused = paused
+	if !paused {
+		for i in 0..len(fs.Folders) {
+			fs.Folders[i].Paused = false
+		}
+	}
+	try home.SaveFolders(fs)
+	if paused {
+		out(ui.Ok("paused every folder: the agent keeps running, but syncs nothing until tinbox resume"))
+	} else {
+		out(ui.Ok("resumed syncing"))
+	}
+}
+
+// ---- history ----
+
+// target is the node a FILE argument names: its folder, its path in the folder, and its id when the server has it.
+fn target(word str) !(home.Folder, str, i64) {
+	let full = try home.Absolute(word)
+	let fs = try home.LoadFolders()
+	let f = home.FolderOf(fs, full)
+	if f == nil {
+		fail "{home.Tilde(full)} is not in a linked folder"
+	}
+	if full == f.Path {
+		fail "name a file inside the folder"
+	}
+	let rel = full[len(f.Path) + 1:]
+	let st = try engine.Load(f.Path)
+	let (b, ok) = st.Base[twine.ToLower(rel)]
+	if ok {
+		return f, rel, b.Id
+	}
+	return f, rel, 0
+}
+
+fn versions(a Args) ! {
+	if len(a.Words) != 1 {
+		fail "usage: tinbox versions FILE"
+	}
+	let (f, rel, id) = try target(a.Words[0])
+	if id == 0 {
+		fail "{rel} is not on the server (yet)"
+	}
+	mut c = try client()
+	mut o = api.VersionsOut{Versions: []api.VersionOut{}}
+	try api.Call(mut c, "GET", "/v1/teams/{f.Team}/nodes/{id}/versions", "", mut o)
+	out("")
+	out(ui.Info(rel))
+	for i, v in o.Versions {
+		let when = tide.Format(v.At * tide.Second, tide.Local(), "2 Jan 2006 15:04")
+		mut now = ""
+		if i == 0 {
+			now = ui.Green("  current")
+		}
+		out(ui.Row(2, ui.Bold("rev {v.Rev}") + "  " + when + now, ui.Dim(ui.Size(v.Size))))
+	}
+	out("")
+	out(ui.Info("tinbox restore {a.Words[0]} --rev N brings one back"))
+}
+
+// RestoreIn is a restore's body.
+type RestoreIn struct {
+	@json("rev") Rev i64
+}
+
+fn restore(a Args) ! {
+	if len(a.Words) != 1 {
+		fail "usage: tinbox restore FILE [--rev N]"
+	}
+	let (f, rel, known) = try target(a.Words[0])
+	mut c = try client()
+	mut id = known
+	if id == 0 || !quarry.Exists(f.Path + "/" + rel) {
+		// a deleted file: find it in the trash by name and folder
+		mut o = api.NodesOut{Nodes: []proto.NodeOut{}}
+		try api.Call(mut c, "GET", "/v1/teams/{f.Team}/trash", "", mut o)
+		let name = local.Base(rel)
+		for n in o.Nodes {
+			if twine.ToLower(n.Name) == twine.ToLower(name) && (known == 0 || n.Id == known) {
+				id = n.Id
+				break
+			}
+		}
+		if id == 0 {
+			fail "{rel} is not in the trash (tinbox trash lists what is)"
+		}
+	}
+	mut rev = 0
+	if len(a.Flags["--rev"]) > 0 {
+		rev = try mint.Atoi(a.Flags["--rev"]) wrap "--rev"
+	}
+	mut r = proto.Result{OpId: "", Status: "", Node: 0, Rev: 0, PlaceRev: 0, Hash: "", Replayed: false, Missing: []str{}, Message: "", Current: nil}
+	try api.Call(mut c, "POST", "/v1/teams/{f.Team}/nodes/{id}/restore", api.Encode(RestoreIn{Rev: rev}), mut r)
+	out(ui.Ok("restored {rel}: it comes back here with the next sync"))
+}
+
+fn trash(a Args) ! {
+	let f = try here()
+	mut c = try client()
+	mut o = api.NodesOut{Nodes: []proto.NodeOut{}}
+	try api.Call(mut c, "GET", "/v1/teams/{f.Team}/trash", "", mut o)
+	out("")
+	if len(o.Nodes) == 0 {
+		out(ui.Info("the trash is empty"))
+	}
+	for n in o.Nodes {
+		mut what = ui.Size(n.Size)
+		if n.Kind == proto.KindDir {
+			what = "folder"
+		}
+		out(ui.Row(2, ui.Red("× ") + n.Name, ui.Dim(what + " · seq {n.DeletedSeq}")))
+	}
+	out("")
+	out(ui.Info("tinbox restore PATH brings one back (kept 30 days)"))
+}
+
+// RewindIn is a rewind's body.
+type RewindIn struct {
+	@json("seq") Seq i64
+}
+
+fn rewind(a Args) ! {
+	if len(a.Words) != 1 {
+		fail "usage: tinbox rewind SEQ"
+	}
+	let seq = try mint.Atoi(a.Words[0]) wrap "SEQ"
+	let f = try here()
+	if !flag(a, "--yes") && !yes("Put team {f.TeamName}'s whole folder back as it was at seq {seq}, for everyone?") {
+		out(ui.Info("nothing changed"))
+		return
+	}
+	mut c = try client()
+	mut o = api.RewindOut{Changed: 0, Seq: 0, RootHash: ""}
+	try api.Call(mut c, "POST", "/v1/teams/{f.Team}/rewind", api.Encode(RewindIn{Seq: seq}), mut o)
+	out(ui.Ok("rewound {f.TeamName} to seq {seq}: {o.Changed} changes, now at seq {o.Seq}"))
+}
+
+// ---- settings ----
+
+fn config(a Args) ! {
+	mut folder = ""
+	if flag(a, "--folder") {
+		let f = try here()
+		folder = f.Path
+	} else {
+		let f = hereOrNil()
+		if f != nil && len(a.Words) == 0 {
+			folder = f.Path
+		}
+	}
+	if len(a.Words) == 0 {
+		let es = try settings.Entries(folder)
+		out("")
+		for e in es {
+			mut from = ui.Dim(e.From)
+			if e.From != "default" {
+				from = ui.Cyan(e.From)
+			}
+			out("  " + ui.Pad(ui.Bold(e.Key), 16) + ui.Pad(e.Value, 10) + ui.Pad(from, 9) + ui.Dim(e.Help))
+		}
+		out("")
+		out(ui.Info("tinbox config set KEY VALUE [--folder]   ·   tinbox config unset KEY [--folder]"))
+		return
+	}
+	if a.Words[0] == "set" && len(a.Words) == 3 {
+		try settings.Set(a.Words[1], a.Words[2], folder)
+		mut scope = "every folder"
+		if len(folder) > 0 {
+			scope = home.Tilde(folder)
+		}
+		out(ui.Ok("{a.Words[1]} = {a.Words[2]} for {scope}"))
+		return
+	}
+	if a.Words[0] == "unset" && len(a.Words) == 2 {
+		try settings.Unset(a.Words[1], folder)
+		out(ui.Ok("{a.Words[1]} is back to its default"))
+		return
+	}
+	if a.Words[0] == "get" && len(a.Words) == 2 {
+		let v = try settings.Value(a.Words[1], folder)
+		out(v)
+		return
+	}
+	fail "usage: tinbox config [set KEY VALUE | unset KEY | get KEY] [--folder]"
+}
+
+// ---- installing ----
+
+fn platform() str {
+	let r = spawn.Run(spawn.Cmd{Argv: []str{"uname", "-sm"}, Env: spawn.Env.Inherit, Dir: "", Stdin: spawn.Stdio.Null, Stdout: spawn.Stdio.Pipe, Stderr: spawn.Stdio.Null, MaxOutput: 0, Input: ""}) catch _ {
+		spawn.Result{Code: 1, Stdout: "", Stderr: ""}
+	}
+	let s = twine.ToLower(r.Stdout)
+	mut os = "linux"
+	if twine.Contains(s, "darwin") {
+		os = "darwin"
+	}
+	mut arch = "amd64"
+	if twine.Contains(s, "arm64") || twine.Contains(s, "aarch64") {
+		arch = "arm64"
+	}
+	return os + "-" + arch
+}
+
+// get fetches a URL, following redirects (GitHub's downloads redirect to their storage).
+fn get(url str) !wire.Resp {
+	mut u = url
+	for hop in 0..6 {
+		let r = try wire.DoWith("GET", u, []str{"User-Agent", "tinbox-cli/" + version}, "", wire.Options{Timeout: 300 * tide.Second, MaxBody: 0, TLS: nil, MaxIdle: 0, NoH2: false, H2C: false, Trace: nil})
+		if r.Status == 301 || r.Status == 302 || r.Status == 303 || r.Status == 307 || r.Status == 308 {
+			u = r.Header("location")
+			continue
+		}
+		if hop >= 0 {
+			return r
+		}
+	}
+	fail "too many redirects for {url}"
+}
+
+// ReleaseOut is the part of GitHub's latest-release answer the updater reads.
+type ReleaseOut struct {
+	@json("tag_name") Tag str
+}
+
+fn update(a Args) ! {
+	let rel = try get("https://api.github.com/repos/{repo}/releases/latest")
+	if rel.Status != 200 {
+		fail "no release found on github.com/{repo} ({rel.Status})"
+	}
+	mut r = ReleaseOut{Tag: ""}
+	try argo.Get(rel.Body, mut r)
+	let latest = twine.TrimPrefix(r.Tag, "v")
+	if latest == version {
+		out(ui.Ok("tinbox {version} is the latest"))
+		return
+	}
+	if flag(a, "--check") {
+		out(ui.Info("tinbox {latest} is out (this is {version}): tinbox update installs it"))
+		return
+	}
+	let asset = "tinbox-" + platform()
+	let base = "https://github.com/{repo}/releases/download/{r.Tag}/"
+	let sums = try get(base + "SHA256SUMS")
+	let bin = try get(base + asset)
+	if sums.Status != 200 || bin.Status != 200 {
+		fail "downloading {asset} {r.Tag}: {bin.Status}"
+	}
+	mut want = ""
+	for line in twine.Split(sums.Body, "\n") {
+		let fields = twine.Fields(line)
+		if len(fields) == 2 && fields[1] == asset {
+			want = fields[0]
+		}
+	}
+	let got = seal.Hex(seal.Sha256(bin.Body))
+	if len(want) == 0 || got != want {
+		fail "the download's checksum does not match SHA256SUMS: not installed"
+	}
+	let exe = try agent.Executable()
+	let tmp = exe + ".new"
+	try quarry.WriteFile(tmp, bin.Body)
+	try quarry.Chmod(tmp, 0o755)
+	try quarry.Rename(tmp, exe)
+	out(ui.Ok("updated tinbox {version} → {latest}"))
+	if agent.Running() {
+		_ = try agent.Stop()
+		try agent.Start()
+		out(ui.Ok("restarted the background agent"))
+	}
+}
+
+fn uninstall(a Args) ! {
+	_ = try agent.Stop()
+	out(ui.Ok("stopped tinbox and removed its login item"))
+	if flag(a, "--all") {
+		let creds = home.LoadCredentials() catch _ {
+			nil
+		}
+		if creds != nil {
+			mut c = try api.FromCredentials(creds)
+			let (_, revokeErr) = c.Raw("DELETE", "/v1/devices/{creds.Device}", "", "application/json")
+			if revokeErr != nil {
+				out(ui.Warn("could not reach the server to revoke this Mac"))
+			}
+		}
+		let fs = home.LoadFolders() catch _ {
+			home.FoldersFile{Folders: []home.Folder{}, Paused: false}
+		}
+		for f in fs.Folders {
+			quarry.RemoveAll(engine.Dir(f.Path)) catch _ {
+			}
+		}
+		try quarry.RemoveAll(home.Dir())
+		out(ui.Ok("removed this Mac's key, settings and sync state (your folders' files stay)"))
+	}
+	let exe = try agent.Executable()
+	try quarry.Remove(exe)
+	out(ui.Ok("removed {exe}"))
+}
+
+fn help() {
+	let lines = []str{
+		"",
+		"  " + ui.Bold("tinbox") + ui.Dim(" {version}") + "  sync a folder on this Mac with your tinbox server",
+		"",
+		ui.Dim("  account"),
+		"    tinbox login SERVER [--invite CODE]   sign this Mac in (no code: approve it from another Mac)",
+		"    tinbox logout                         revoke this Mac and forget its key",
+		"    tinbox whoami                         you, this Mac, the server, your teams",
+		"    tinbox approve CODE                   let another of your Macs in",
+		"    tinbox devices [revoke ID]            your Macs",
+		"",
+		ui.Dim("  teams"),
+		"    tinbox teams                          your teams",
+		"    tinbox team create NAME               a new team, with you as owner",
+		"    tinbox invite EMAIL [--team T]        a one-use invite code (--role owner|member)",
+		"    tinbox members [--team T]             who is in a team",
+		"",
+		ui.Dim("  folders  (run inside the folder)"),
+		"    tinbox init [--team T]                link this folder to a team and start syncing",
+		"    tinbox status [--watch|--skipped]     what is happening (--json for scripts)",
+		"    tinbox sync [--confirm-deletes]       one sync now, when the agent is stopped",
+		"    tinbox log [-n N]                     what was synced lately",
+		"    tinbox unlink                         stop syncing this folder (the files stay)",
+		"",
+		ui.Dim("  background"),
+		"    tinbox start                          sync every folder in the background, also after login",
+		"    tinbox stop                           stop everything: nothing of tinbox keeps running",
+		"    tinbox pause | resume [--folder]      hold syncing without stopping",
+		"",
+		ui.Dim("  history"),
+		"    tinbox versions FILE                  a file's versions",
+		"    tinbox restore FILE [--rev N]         bring back a version, or a deleted file",
+		"    tinbox trash                          what was deleted (kept 30 days)",
+		"    tinbox rewind SEQ                     owners: the whole folder as it was",
+		"",
+		ui.Dim("  settings and install"),
+		"    tinbox config [set KEY VALUE]         max-file-size, upload-limit, download-limit, scan-interval",
+		"    tinbox update [--check]               install the newest release",
+		"    tinbox uninstall [--all]              remove tinbox (--all: also its key and settings)",
+		"    tinbox version",
+		"",
+	}
+	out(twine.Join(lines, "\n"))
+}
+
+fn run(a Args) ! {
+	let cmd = a.Command
+	if cmd == "login" {
+		try login(a)
+	} else if cmd == "logout" {
+		try logout(a)
+	} else if cmd == "whoami" {
+		try whoami(a)
+	} else if cmd == "approve" {
+		try approve(a)
+	} else if cmd == "devices" {
+		try devices(a)
+	} else if cmd == "teams" {
+		try teams(a)
+	} else if cmd == "team" {
+		try team(a)
+	} else if cmd == "invite" {
+		try invite(a)
+	} else if cmd == "members" {
+		try members(a)
+	} else if cmd == "init" {
+		try init(a)
+	} else if cmd == "unlink" {
+		try unlink(a)
+	} else if cmd == "sync" {
+		try sync(a)
+	} else if cmd == "status" {
+		try status(a)
+	} else if cmd == "log" {
+		try log(a)
+	} else if cmd == "start" {
+		try start(a)
+	} else if cmd == "stop" {
+		try stop(a)
+	} else if cmd == "pause" {
+		try pause(a, true)
+	} else if cmd == "resume" {
+		try pause(a, false)
+	} else if cmd == "versions" {
+		try versions(a)
+	} else if cmd == "restore" {
+		try restore(a)
+	} else if cmd == "trash" {
+		try trash(a)
+	} else if cmd == "rewind" {
+		try rewind(a)
+	} else if cmd == "config" {
+		try config(a)
+	} else if cmd == "update" {
+		try update(a)
+	} else if cmd == "uninstall" {
+		try uninstall(a)
+	} else if cmd == "agent" {
+		agent.Run()
+	} else if cmd == "version" || cmd == "--version" {
+		let creds = home.LoadCredentials() catch _ {
+			nil
+		}
+		mut server = ""
+		if creds != nil {
+			server = ui.Dim("  · " + creds.Server)
+		}
+		out("tinbox {version}" + server)
+	} else if cmd == "" || cmd == "help" || cmd == "-h" || cmd == "--help" {
+		help()
+	} else {
+		fail "unknown command {cmd:q}: tinbox help lists them"
+	}
+}
+
+fn main() {
+	let a = parse(quarry.Args()) catch err {
+		quarry.Eprintln(ui.Fail(fault.Message(err)))
+		quarry.Exit(2)
+		return
+	}
+	run(a) catch err {
+		quarry.Eprintln(ui.Fail(fault.Message(err)))
+		quarry.Exit(1)
+	}
+}

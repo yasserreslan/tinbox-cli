@@ -1,0 +1,383 @@
+package ui
+
+import "../agent"
+import "../home"
+import "glyph"
+import "say"
+import "tide"
+import "tty"
+import "twine"
+
+// How the CLI looks: two aligned columns, a few symbols that carry state (● ✓ ↑ ↓ ⚠ ✗ ‖ ○), colour when standard
+// output is a terminal (and NO_COLOR is unset), plain text otherwise.
+
+let color = tty.Colors(1)
+
+fn paint(code str, s str) str {
+	return tty.Paint(color, code, s)
+}
+
+// Green, Blue, Yellow, Red, Dim, Bold and Cyan colour s.
+fn Green(s str) str {
+	return paint("32", s)
+}
+
+fn Blue(s str) str {
+	return paint("34", s)
+}
+
+fn Yellow(s str) str {
+	return paint("33", s)
+}
+
+fn Red(s str) str {
+	return paint("31", s)
+}
+
+fn Dim(s str) str {
+	return paint("2", s)
+}
+
+fn Bold(s str) str {
+	return paint("1", s)
+}
+
+fn Cyan(s str) str {
+	return paint("36", s)
+}
+
+// Width is the terminal's width, between 60 and 110 columns (80 when it is not a terminal).
+fn Width() i64 {
+	let (w, _, err) = tty.Size(1)
+	if err != nil || w <= 0 {
+		return 80
+	}
+	return max(60, min(110, w))
+}
+
+// visible is how many columns s takes: its runes, without colour codes.
+fn visible(s str) i64 {
+	mut b = twine.Builder{}
+	mut i = 0
+	for i < len(s) {
+		if s[i] == 27 {
+			for i < len(s) && s[i] != 'm' {
+				i += 1
+			}
+			i += 1
+			continue
+		}
+		b.Byte(s[i])
+		i += 1
+	}
+	return glyph.RuneCount(b.String())
+}
+
+fn pad(s str, n i64) str {
+	let v = visible(s)
+	if v >= n {
+		return s + " "
+	}
+	return s + twine.Repeat(" ", n - v)
+}
+
+// Row is a line of two columns, the right one starting at a fixed column.
+fn Row(indent i64, left str, right str) str {
+	let col = max(36, Width() * 55 / 100)
+	return twine.Repeat(" ", indent) + pad(left, col - indent) + right
+}
+
+// Clip shortens s to n columns with an ellipsis in the middle.
+fn Clip(s str, n i64) str {
+	if glyph.RuneCount(s) <= n || n < 8 {
+		return s
+	}
+	mut starts = []i64{}
+	for i, _ in s {
+		starts = append(starts, i)
+	}
+	let head = (n - 1) / 2
+	let tail = n - 1 - head
+	return s[0:starts[head]] + "…" + s[starts[len(starts) - tail]:]
+}
+
+// Count is n with thousands separators.
+fn Count(n i64) str {
+	let s = say.Str(n)
+	if len(s) <= 3 {
+		return s
+	}
+	mut b = twine.Builder{}
+	let first = len(s) % 3
+	for i in 0..len(s) {
+		if i > 0 && (i - first) % 3 == 0 {
+			b.Str(",")
+		}
+		b.Byte(s[i])
+	}
+	return b.String()
+}
+
+fn oneDecimal(v i64, unit i64, name str) str {
+	let tenths = (v * 10 + unit / 2) / unit
+	if tenths >= 100 {
+		return "{(v + unit / 2) / unit} {name}"
+	}
+	return "{tenths / 10}.{tenths % 10} {name}"
+}
+
+// Size is a byte count as B, KB, MB or GB.
+fn Size(n i64) str {
+	if n < 1024 {
+		return "{n} B"
+	}
+	if n < 1048576 {
+		return oneDecimal(n, 1024, "KB")
+	}
+	if n < 1073741824 {
+		return oneDecimal(n, 1048576, "MB")
+	}
+	return oneDecimal(n, 1073741824, "GB")
+}
+
+// Rate is a speed in bits per second, as people quote line speeds.
+fn Rate(bytesPerSecond i64) str {
+	let bits = bytesPerSecond * 8
+	if bits < 1000000 {
+		return "{bits / 1000} kbps"
+	}
+	return oneDecimal(bits, 1000000, "Mbps")
+}
+
+// Ago is how long ago a unix time was.
+fn Ago(unix i64) str {
+	if unix <= 0 {
+		return "never"
+	}
+	let d = tide.Wall() / tide.Second - unix
+	if d < 2 {
+		return "just now"
+	}
+	if d < 60 {
+		return "{d} s ago"
+	}
+	if d < 3600 {
+		return "{d / 60} min ago"
+	}
+	if d < 86400 {
+		return "{d / 3600} h ago"
+	}
+	return tide.Format(unix * tide.Second, tide.Local(), "2 Jan 15:04")
+}
+
+// Eta is the time left for left bytes at rate bytes per second.
+fn Eta(left i64, rate i64) str {
+	if rate <= 0 {
+		return ""
+	}
+	let s = left / rate
+	if s < 60 {
+		return "{s}s left"
+	}
+	if s < 3600 {
+		return "{s / 60}m {s % 60}s left"
+	}
+	return "{s / 3600}h {s % 3600 / 60}m left"
+}
+
+// Bar is a progress bar n cells wide.
+fn Bar(done i64, total i64, n i64) str {
+	mut filled = 0
+	if total > 0 {
+		filled = min(n, done * n / total)
+	}
+	return Blue(twine.Repeat("█", filled)) + Dim(twine.Repeat("░", n - filled))
+}
+
+fn host(url str) str {
+	return twine.TrimPrefix(twine.TrimPrefix(url, "https://"), "http://")
+}
+
+fn label(s str) str {
+	return Dim(pad(s, 9))
+}
+
+// Limits is the settings line at the bottom of the status.
+type Limits struct {
+	Upload  str
+	MaxFile str
+	Scan    str
+}
+
+fn busy(f agent.FolderStatus) bool {
+	return f.Phase == "uploading" || f.Phase == "downloading"
+}
+
+fn headline(s agent.Status, running bool) str {
+	if s.SignedOut {
+		return Red("✗ signed out") + Dim("   tinbox login")
+	}
+	if !running {
+		return Dim("○ stopped")
+	}
+	if s.Paused {
+		return Yellow("‖ paused") + Dim("   tinbox resume")
+	}
+	for f in s.Folders {
+		if busy(f) {
+			return Blue("● syncing")
+		}
+	}
+	mut all = len(s.Folders) > 0
+	for f in s.Folders {
+		if f.Phase == "error" {
+			return Yellow("● running") + Dim("  · see below")
+		}
+		if !f.Verified {
+			all = false
+		}
+	}
+	if all {
+		return Green("● up to date")
+	}
+	return Green("● running")
+}
+
+fn folderLines(f agent.FolderStatus, running bool, lim Limits, out mut []str) {
+	let title = Bold(home.Tilde(f.Path))
+	out = append(out, Row(2, title, Dim("team ") + f.TeamName))
+	if f.Phase == "paused" {
+		out = append(out, Row(4, Yellow("‖ paused"), Dim("tinbox resume")))
+	} else if f.Phase == "uploading" || f.Phase == "downloading" {
+		let up = f.Phase == "uploading"
+		mut what = Blue("↓ downloading")
+		mut n = f.PendingDown
+		if up {
+			what = Blue("↑ uploading")
+			n = f.PendingUp
+		}
+		mut files = "{max(n, 1)} files"
+		if n <= 1 {
+			files = "1 file"
+		}
+		out = append(out, Row(4, what + " " + files, Dim(Size(max(f.Total - f.Done, 0)) + " to go in this file")))
+		let pct = match f.Total > 0 {
+			true => f.Done * 100 / f.Total
+			false => 0
+		}
+		let name = Clip(f.Transfer, 22)
+		out = append(out, Row(6, pad(name, 15) + Bar(f.Done, f.Total, 18) + " " + say.Str(pct) + "%", Dim(Rate(f.Rate) + " · " + Eta(f.Total - f.Done, f.Rate))))
+	} else if f.Phase == "checking" {
+		out = append(out, Row(4, Cyan("◌ checking for changes"), Dim("last sync " + Ago(f.LastSync))))
+	} else if f.Phase == "error" {
+		out = append(out, Row(4, Red("✗ " + Clip(f.Error, 60)), Dim("tinbox log")))
+	} else if !running {
+		out = append(out, Row(4, Dim("○ not syncing"), Dim("last sync " + Ago(f.LastSync))))
+	} else if f.Verified {
+		out = append(out, Row(4, Green("✓ up to date"), Dim("checked " + Ago(f.LastSync))))
+	} else {
+		out = append(out, Row(4, Cyan("◌ syncing"), Dim("last sync " + Ago(f.LastSync))))
+	}
+	mut match_ = Dim("not verified yet")
+	if f.Verified {
+		match_ = Green("✓") + " matches the server"
+	} else if len(f.Skipped) > 0 {
+		match_ = Dim("skipped files are not on the server")
+	}
+	out = append(out, Row(4, Count(f.Files) + " files · " + Size(f.Bytes), match_))
+	if len(f.Skipped) > 0 {
+		mut n = "{len(f.Skipped)} files"
+		if len(f.Skipped) == 1 {
+			n = "1 file"
+		}
+		out = append(out, Row(4, Yellow("⚠ {n} over {lim.MaxFile}, not uploaded"), Dim("tinbox status --skipped")))
+	}
+	if len(f.Conflicts) > 0 {
+		let first = Clip(f.Conflicts[len(f.Conflicts) - 1], 40)
+		mut what = "⚠ {len(f.Conflicts)} conflicts"
+		if len(f.Conflicts) == 1 {
+			what = "⚠ 1 conflict"
+		}
+		out = append(out, Row(4, Yellow(what), Dim(first)))
+	}
+	if f.Waiting > 0 {
+		out = append(out, Row(4, Yellow("⚠ {f.Waiting} deletes held back"), Dim("tinbox sync --confirm-deletes")))
+	}
+	if f.Phase != "error" && len(f.Error) > 0 && f.Waiting == 0 {
+		out = append(out, Row(4, Yellow("⚠ " + Clip(f.Error, 60)), ""))
+	}
+}
+
+// Status is the whole status view. only, when not "", shows that folder alone.
+fn Status(s agent.Status, running bool, creds ?home.Credentials, lim Limits, only str) str {
+	mut out = []str{""}
+	mut who = ""
+	if creds != nil {
+		mut name = creds.Name
+		if len(name) == 0 {
+			name = creds.Email
+		}
+		who = Dim(name + " · " + creds.DeviceName)
+	}
+	out = append(out, Row(2, label("tinbox") + headline(s, running), who))
+	if !running && !s.SignedOut {
+		out = append(out, Row(2, label("") + Dim("nothing runs in the background · tinbox start"), ""))
+	}
+	if creds != nil {
+		mut reach = Dim("–")
+		if running && !s.SignedOut {
+			reach = match s.ServerOk {
+				true => Green("✓") + " reachable" + Dim(" · {s.LatencyMs} ms")
+				false => Red("✗ unreachable") + Dim(" · changes wait here")
+			}
+		}
+		out = append(out, Row(2, label("server") + Clip(host(creds.Server), 34), reach))
+	}
+	mut shown = 0
+	for f in s.Folders {
+		if len(only) > 0 && f.Path != only {
+			continue
+		}
+		out = append(out, "")
+		folderLines(f, running, lim, mut out)
+		shown += 1
+	}
+	if shown == 0 {
+		out = append(out, "")
+		out = append(out, "  " + Dim("no folders yet · cd into one and run ") + "tinbox init")
+	}
+	out = append(out, "")
+	out = append(out, Row(2, label("limits") + "upload " + lim.Upload + Dim(" · ") + "files up to " + lim.MaxFile + Dim(" · ") + "scan every " + lim.Scan, ""))
+	out = append(out, "")
+	return twine.Join(out, "\n")
+}
+
+// Plural is "1 file" or "N files".
+fn Plural(n i64, one str, many str) str {
+	if n == 1 {
+		return "1 " + one
+	}
+	return Count(n) + " " + many
+}
+
+// Pad is s padded with spaces to n columns.
+fn Pad(s str, n i64) str {
+	return pad(s, n)
+}
+
+// Ok, Warn, Fail and Info are one-line messages.
+fn Ok(s str) str {
+	return Green("✓") + " " + s
+}
+
+fn Warn(s str) str {
+	return Yellow("⚠") + " " + s
+}
+
+fn Fail(s str) str {
+	return Red("✗") + " " + s
+}
+
+fn Info(s str) str {
+	return Dim("  " + s)
+}

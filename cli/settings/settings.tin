@@ -1,0 +1,275 @@
+package settings
+
+import "../home"
+import "fault"
+import "mint"
+import "quarry"
+import "tide"
+import "twine"
+
+// Settings (README, "Settings"): defaults, overridden by ~/.config/tinbox/settings for every folder, overridden by a
+// folder's own .tinbox/settings. Each file is key = value lines.
+
+// ErrSetting is the fault of a setting that cannot be used.
+let ErrSetting = fault("setting")
+
+// Settings is what one folder syncs with. Rates are bytes per second, 0 for no limit.
+type Settings struct {
+	MaxFileSize   i64
+	UploadLimit   i64
+	DownloadLimit i64
+	ScanInterval  i64
+}
+
+// Entry is one setting as written, and where its value comes from: default, global or folder.
+type Entry struct {
+	Key   str
+	Value str
+	From  str
+	Help  str
+}
+
+// Key is a setting's name, default and meaning.
+type Key struct {
+	Name    str
+	Default str
+	Help    str
+}
+
+// Keys is every setting.
+fn Keys() []Key {
+	return []Key{
+		Key{Name: "max-file-size", Default: "2MB", Help: "larger files are not uploaded (0: no limit)"},
+		Key{Name: "upload-limit", Default: "50kbps", Help: "upload speed cap: 50kbps, 50KB/s, 1MB/s (0: none)"},
+		Key{Name: "download-limit", Default: "0", Help: "download speed cap, same units (0: none)"},
+		Key{Name: "scan-interval", Default: "5s", Help: "how often folders are checked for changes"},
+	}
+}
+
+fn known(key str) bool {
+	for k in Keys() {
+		if k.Name == key {
+			return true
+		}
+	}
+	return false
+}
+
+fn number(s str, what str) !f64 {
+	let n = mint.ParseFloat(s) catch _ {
+		fail fault.Wrap(ErrSetting, "{what:q} is not a number with a unit")
+		0.0
+	}
+	if n < 0.0 {
+		fail fault.Wrap(ErrSetting, "{what:q} cannot be negative")
+	}
+	return n
+}
+
+// ParseSize reads a size: 2MB, 500KB, 1.5GB, 1048576 (bytes), 0 for no limit. Units are powers of 1024.
+fn ParseSize(s str) !i64 {
+	let t = twine.ToLower(twine.TrimSpace(s))
+	if t == "0" || t == "none" || t == "unlimited" {
+		return 0
+	}
+	mut mult = 1.0
+	mut num = t
+	for unit in []str{"kb", "mb", "gb", "k", "m", "g", "b"} {
+		if twine.HasSuffix(t, unit) {
+			num = twine.TrimSpace(t[0:len(t) - len(unit)])
+			mult = match unit[0] {
+				'k' => 1024.0
+				'm' => 1048576.0
+				'g' => 1073741824.0
+				_ => 1.0
+			}
+			break
+		}
+	}
+	let n = try number(num, s)
+	return i64(n * mult)
+}
+
+// ParseRate reads a speed as bytes per second: 50kbps and 2mbps are bits (powers of 1000), 50KB/s and 1MB/s are
+// bytes (powers of 1024); 0 is no limit.
+fn ParseRate(s str) !i64 {
+	let t = twine.ToLower(twine.TrimSpace(s))
+	if t == "0" || t == "none" || t == "unlimited" {
+		return 0
+	}
+	let units = []str{"kbps", "mbps", "gbps", "bps", "kb/s", "mb/s", "gb/s", "b/s"}
+	for unit in units {
+		if !twine.HasSuffix(t, unit) {
+			continue
+		}
+		let n = try number(twine.TrimSpace(t[0:len(t) - len(unit)]), s)
+		let perSecond = match unit {
+			"kbps" => n * 1000.0 / 8.0
+			"mbps" => n * 1000000.0 / 8.0
+			"gbps" => n * 1000000000.0 / 8.0
+			"bps" => n / 8.0
+			"kb/s" => n * 1024.0
+			"mb/s" => n * 1048576.0
+			"gb/s" => n * 1073741824.0
+			_ => n
+		}
+		let r = i64(perSecond)
+		if r < 1 {
+			fail fault.Wrap(ErrSetting, "{s:q} is less than a byte per second")
+		}
+		return r
+	}
+	fail fault.Wrap(ErrSetting, "{s:q} needs a unit: kbps, mbps, KB/s or MB/s")
+}
+
+// ParseInterval reads a duration of at least a second: 5s, 1m.
+fn ParseInterval(s str) !i64 {
+	let d = tide.ParseDuration(twine.TrimSpace(s)) catch _ {
+		fail fault.Wrap(ErrSetting, "{s:q} is not a duration such as 5s or 1m")
+		0
+	}
+	if d < tide.Second {
+		fail fault.Wrap(ErrSetting, "check at most once a second")
+	}
+	return d
+}
+
+fn check(key str, value str) ! {
+	if !known(key) {
+		mut names = []str{}
+		for k in Keys() {
+			names = append(names, k.Name)
+		}
+		let all = twine.Join(names, ", ")
+		fail fault.Wrap(ErrSetting, "no setting {key:q}: {all}")
+	}
+	if key == "max-file-size" {
+		_ = try ParseSize(value)
+	} else if key == "scan-interval" {
+		_ = try ParseInterval(value)
+	} else {
+		_ = try ParseRate(value)
+	}
+}
+
+fn readFile(p str) !map[str]str {
+	mut out = map[str]str{}
+	if !quarry.Exists(p) {
+		return out
+	}
+	let text = try quarry.ReadFileBound(p, 65536)
+	for line in twine.Split(text, "\n") {
+		let t = twine.TrimSpace(line)
+		if len(t) == 0 || t[0] == '#' {
+			continue
+		}
+		let (k, v, ok) = twine.Cut(t, "=")
+		if ok {
+			out[twine.TrimSpace(k)] = twine.TrimSpace(v)
+		}
+	}
+	return out
+}
+
+fn writeFile(p str, vals map[str]str) ! {
+	mut b = twine.Builder{}
+	b.Str("# tinbox settings (tinbox config)\n")
+	for k in Keys() {
+		let (v, ok) = vals[k.Name]
+		if ok {
+			b.Str("{k.Name} = {v}\n")
+		}
+	}
+	try home.WriteAtomic(p, b.String(), 0o600)
+}
+
+// FolderSettingsPath is a folder's own settings file.
+fn FolderSettingsPath(folder str) str {
+	return folder + "/.tinbox/settings"
+}
+
+// Entries is every setting for folder ("" for none) and where its value comes from.
+fn Entries(folder str) ![]Entry {
+	let global = try readFile(home.SettingsPath())
+	mut local = map[str]str{}
+	if len(folder) > 0 {
+		local = try readFile(FolderSettingsPath(folder))
+	}
+	mut out = []Entry{}
+	for k in Keys() {
+		mut e = Entry{Key: k.Name, Value: k.Default, From: "default", Help: k.Help}
+		let (gv, inGlobal) = global[k.Name]
+		if inGlobal {
+			e.Value = gv
+			e.From = "global"
+		}
+		let (lv, inLocal) = local[k.Name]
+		if inLocal {
+			e.Value = lv
+			e.From = "folder"
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// Load is the settings folder syncs with.
+fn Load(folder str) !Settings {
+	let es = try Entries(folder)
+	mut s = Settings{MaxFileSize: 0, UploadLimit: 0, DownloadLimit: 0, ScanInterval: 5 * tide.Second}
+	for e in es {
+		let v = e.Value
+		if e.Key == "max-file-size" {
+			s.MaxFileSize = try ParseSize(v) wrap "max-file-size"
+		} else if e.Key == "upload-limit" {
+			s.UploadLimit = try ParseRate(v) wrap "upload-limit"
+		} else if e.Key == "download-limit" {
+			s.DownloadLimit = try ParseRate(v) wrap "download-limit"
+		} else if e.Key == "scan-interval" {
+			s.ScanInterval = try ParseInterval(v) wrap "scan-interval"
+		}
+	}
+	return s
+}
+
+// Value is one setting's value as written, for folder ("" for the global one).
+fn Value(key str, folder str) !str {
+	let es = try Entries(folder)
+	for e in es {
+		if e.Key == key {
+			return e.Value
+		}
+	}
+	fail fault.Wrap(ErrSetting, "no setting {key:q}")
+}
+
+// Set changes a setting for every folder, or for folder alone when it is not "".
+fn Set(key str, value str, folder str) ! {
+	try check(key, value)
+	mut p = home.SettingsPath()
+	if len(folder) > 0 {
+		p = FolderSettingsPath(folder)
+	} else {
+		try home.Ensure()
+	}
+	mut vals = try readFile(p)
+	vals[key] = value
+	try writeFile(p, vals)
+}
+
+// Unset goes back to the default (or, for a folder, to the global value).
+fn Unset(key str, folder str) ! {
+	if !known(key) {
+		fail fault.Wrap(ErrSetting, "no setting {key:q}")
+	}
+	mut p = home.SettingsPath()
+	if len(folder) > 0 {
+		p = FolderSettingsPath(folder)
+	}
+	if !quarry.Exists(p) {
+		return
+	}
+	mut vals = try readFile(p)
+	delete(vals, key)
+	try writeFile(p, vals)
+}

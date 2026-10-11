@@ -1,0 +1,386 @@
+package agent
+
+import "../../proto"
+import "../api"
+import "../engine"
+import "../home"
+import "../settings"
+import "argo"
+import "fault"
+import "quarry"
+import "spawn"
+import "tide"
+import "twine"
+
+// The background agent (tinbox start): one process that syncs every linked folder, a scan interval apart, and
+// writes what it is doing to status.json every second, which tinbox status reads. On macOS it is a launchd login
+// item, so it runs after the terminal closes and again at every login; tinbox stop removes it, and then nothing of
+// tinbox runs.
+
+// Label is the launchd job's name.
+const Label = "dev.tinbox.agent"
+
+// FolderStatus is one linked folder in the status file.
+type FolderStatus struct {
+	@json("path") Path str
+	@json("team_name") TeamName str
+	@json("phase") Phase str
+	@json("transfer") Transfer str
+	@json("done") Done i64
+	@json("total") Total i64
+	@json("rate") Rate i64
+	@json("pending_up") PendingUp i64
+	@json("pending_down") PendingDown i64
+	@json("last_sync") LastSync i64
+	@json("files") Files i64
+	@json("bytes") Bytes i64
+	@json("verified") Verified bool
+	@json("skipped") Skipped []str
+	@json("conflicts") Conflicts []str
+	@json("waiting") Waiting i64
+	@json("error") Error str
+}
+
+// Status is the status file.
+type Status struct {
+	@json("pid") Pid i64
+	@json("heartbeat") Heartbeat i64
+	@json("started") Started i64
+	@json("server") Server str
+	@json("server_ok") ServerOk bool
+	@json("latency_ms") LatencyMs i64
+	@json("signed_out") SignedOut bool
+	@json("paused") Paused bool
+	@json("folders") Folders []FolderStatus
+}
+
+fn emptyStatus() Status {
+	return Status{Pid: 0, Heartbeat: 0, Started: 0, Server: "", ServerOk: false, LatencyMs: 0, SignedOut: false, Paused: false, Folders: []FolderStatus{}}
+}
+
+fn now() i64 {
+	return tide.Wall() / tide.Second
+}
+
+// ReadStatus is the status file, nil when there is none.
+fn ReadStatus() ?Status {
+	let p = home.StatusPath()
+	if !quarry.Exists(p) {
+		return nil
+	}
+	let text = quarry.ReadFileBound(p, 16777216) catch _ {
+		return nil
+	}
+	mut s = emptyStatus()
+	argo.Get(text, mut s) catch _ {
+		return nil
+	}
+	return s
+}
+
+fn writeStatus(s Status) {
+	mut b = make([]u8, 0, 4096)
+	argo.Put(mut b, s)
+	home.Ensure() catch _ {
+	}
+	home.WriteAtomic(home.StatusPath(), str(b), 0o600) catch _ {
+	}
+}
+
+// Running reports whether the agent runs: its process is alive, and its heartbeat is fresh or one of its folders
+// is mid-transfer (a long upload writes its progress, not the heartbeat).
+fn Running() bool {
+	let s = ReadStatus()
+	if s == nil {
+		return false
+	}
+	if s.Pid <= 0 || !quarry.Alive(s.Pid) {
+		return false
+	}
+	if now() - s.Heartbeat < 30 {
+		return true
+	}
+	for f in s.Folders {
+		if engine.ReadProgress(f.Path) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+fn folderStatus(f home.Folder) FolderStatus {
+	mut fs = FolderStatus{Path: f.Path, TeamName: f.TeamName, Phase: "idle", Transfer: "", Done: 0, Total: 0, Rate: 0, PendingUp: 0, PendingDown: 0, LastSync: 0, Files: 0, Bytes: 0, Verified: false, Skipped: []str{}, Conflicts: []str{}, Waiting: 0, Error: ""}
+	if engine.Linked(f.Path) {
+		let st = engine.Load(f.Path) catch _ {
+			return fs
+		}
+		fs.LastSync = st.LastSync
+		fs.Files = st.Files
+		fs.Bytes = st.Bytes
+		fs.Verified = st.Verified
+		fs.Skipped = st.Skipped
+		fs.Conflicts = st.Conflicts
+		fs.Waiting = st.Waiting
+		fs.Error = st.LastError
+	} else {
+		fs.Phase = "error"
+		fs.Error = "the folder is missing or no longer linked"
+	}
+	if f.Paused {
+		fs.Phase = "paused"
+	}
+	return fs
+}
+
+// Live folds each folder's live progress (what its cycle wrote in the last seconds) into out.
+fn Live(out mut Status) {
+	for i in 0..len(out.Folders) {
+		let p = engine.ReadProgress(out.Folders[i].Path)
+		if p == nil || (p.Phase != "uploading" && p.Phase != "downloading") || out.Folders[i].Phase == "error" || out.Folders[i].Phase == "paused" {
+			continue
+		}
+		out.Folders[i].Verified = false
+		out.Folders[i].Phase = p.Phase
+		out.Folders[i].Transfer = p.Path
+		out.Folders[i].Done = p.Done
+		out.Folders[i].Total = p.Total
+		out.Folders[i].Rate = p.Rate
+		out.Folders[i].PendingUp = p.PendingUp
+		out.Folders[i].PendingDown = p.PendingDown
+	}
+}
+
+// Snapshot is the status as the files on disk say it, without a running agent.
+fn Snapshot() Status {
+	mut s = emptyStatus()
+	let creds = home.LoadCredentials() catch _ {
+		nil
+	}
+	if creds == nil {
+		s.SignedOut = true
+	} else {
+		s.Server = creds.Server
+	}
+	let folders = home.LoadFolders() catch _ {
+		home.FoldersFile{Folders: []home.Folder{}, Paused: false}
+	}
+	s.Paused = folders.Paused
+	for f in folders.Folders {
+		s.Folders = append(s.Folders, folderStatus(f))
+	}
+	return s
+}
+
+// probe times a request to the server's health check.
+fn probe(server str) (bool, i64) {
+	let t0 = tide.Now()
+	let body = api.Fetch(server + "/healthz") catch _ {
+		return false, 0
+	}
+	return twine.Contains(body, "ok"), tide.Since(t0) / tide.Millisecond
+}
+
+// round syncs every linked folder once, writing the status as it goes.
+fn round(started i64) {
+	mut s = Snapshot()
+	s.Pid = quarry.Pid()
+	s.Started = started
+	s.Heartbeat = now()
+	if len(s.Server) > 0 {
+		let (up, ms) = probe(s.Server)
+		s.ServerOk = up
+		s.LatencyMs = ms
+	}
+	writeStatus(s)
+	if s.SignedOut || s.Paused {
+		return
+	}
+	let creds = home.MustCredentials() catch _ {
+		return
+	}
+	mut c = api.FromCredentials(creds) catch _ {
+		return
+	}
+	let folders = home.LoadFolders() catch _ {
+		return
+	}
+	mut i = 0
+	for f in folders.Folders {
+		let at = i
+		i += 1
+		if f.Paused || !engine.Linked(f.Path) {
+			continue
+		}
+		let conf = settings.Load(f.Path) catch err {
+			mut broken = folderStatus(f)
+			broken.Phase = "error"
+			broken.Error = fault.Message(err)
+			s.Folders[at] = broken
+			continue
+		}
+		s.Heartbeat = now()
+		let rep = engine.Cycle(f.Path, mut c, conf, engine.Options{Confirm: false, Device: creds.DeviceName, Echo: false}) catch err {
+			mut broken = folderStatus(f)
+			broken.Phase = "error"
+			broken.Error = fault.Message(err)
+			s.Folders[at] = broken
+			if fault.Is(err, proto.ErrUnauthorized) {
+				s.SignedOut = true
+			}
+			s.ServerOk = !twine.Contains(fault.Message(err), "reaching")
+			writeStatus(s)
+			continue
+		}
+		s.ServerOk = true
+		mut fresh = folderStatus(f)
+		fresh.Phase = "idle"
+		s.Folders[at] = fresh
+		_ = rep
+		writeStatus(s)
+	}
+}
+
+fn interval() i64 {
+	let conf = settings.Load("") catch _ {
+		return 5 * tide.Second
+	}
+	return conf.ScanInterval
+}
+
+// Run is the agent: a round of syncing, then a wait of the scan interval with the heartbeat kept fresh, forever.
+fn Run() {
+	let started = now()
+	for {
+		arena {
+			round(started)
+		}
+		let wait = interval()
+		mut waited = 0
+		for waited < wait {
+			let step = min(tide.Second, wait - waited)
+			tide.Sleep(step)
+			waited += step
+			arena {
+				mut s = ReadStatus() ?? emptyStatus()
+				s.Pid = quarry.Pid()
+				s.Started = started
+				s.Heartbeat = now()
+				writeStatus(s)
+			}
+		}
+	}
+}
+
+// ---- starting and stopping ----
+
+fn plistPath() str {
+	return quarry.Getenv("HOME") + "/Library/LaunchAgents/" + Label + ".plist"
+}
+
+// launchd reports whether the agent is a launchd login item (macOS); TINBOX_NO_LAUNCHD=1 runs it as a plain
+// detached process instead, as the tests do.
+fn launchd() bool {
+	return quarry.Exists("/bin/launchctl") && quarry.Getenv("TINBOX_NO_LAUNCHD") != "1"
+}
+
+// Executable is the absolute path of this program.
+fn Executable() !str {
+	let arg = quarry.Args()[0]
+	if twine.Contains(arg, "/") {
+		return try home.Absolute(arg)
+	}
+	return try spawn.LookPath(arg)
+}
+
+fn run(argv []str) !spawn.Result {
+	return try spawn.Run(spawn.Cmd{Argv: argv, Env: spawn.Env.Inherit, Dir: "", Stdin: spawn.Stdio.Null, Stdout: spawn.Stdio.Pipe, Stderr: spawn.Stdio.Pipe, MaxOutput: 0, Input: ""})
+}
+
+fn uid() !str {
+	let r = try run([]str{"/usr/bin/id", "-u"})
+	return twine.TrimSpace(r.Stdout)
+}
+
+fn escape(s str) str {
+	return twine.ReplaceAll(twine.ReplaceAll(twine.ReplaceAll(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;")
+}
+
+fn plist(exe str) str {
+	mut env = ""
+	let th = quarry.Getenv("TINBOX_HOME")
+	if len(th) > 0 {
+		env = "\t<key>EnvironmentVariables</key>\n\t<dict><key>TINBOX_HOME</key><string>" + escape(th) + "</string></dict>\n"
+	}
+	let log = escape(home.AgentLog())
+	return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>Label</key><string>" + Label + "</string>\n\t<key>ProgramArguments</key>\n\t<array><string>" + escape(exe) + "</string><string>agent</string></array>\n\t<key>RunAtLoad</key><true/>\n\t<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n\t<key>ProcessType</key><string>Background</string>\n\t<key>LowPriorityIO</key><true/>\n\t<key>StandardOutPath</key><string>" + log + "</string>\n\t<key>StandardErrorPath</key><string>" + log + "</string>\n" + env + "</dict>\n</plist>\n"
+}
+
+// Start starts the agent: a launchd login item on macOS, a detached process elsewhere.
+fn Start() ! {
+	try home.Ensure()
+	let exe = try Executable()
+	if launchd() {
+		let p = plistPath()
+		try quarry.MkdirAll(quarry.Getenv("HOME") + "/Library/LaunchAgents")
+		try quarry.WriteFile(p, plist(exe))
+		let u = try uid()
+		_ = run([]str{"/bin/launchctl", "bootout", "gui/" + u + "/" + Label}) catch _ {
+			spawn.Result{Code: 0, Stdout: "", Stderr: ""}
+		}
+		let r = try run([]str{"/bin/launchctl", "bootstrap", "gui/" + u, p})
+		if r.Code != 0 {
+			fail "launchctl bootstrap: {twine.TrimSpace(r.Stderr)}"
+		}
+	} else {
+		_ = try spawn.Start(spawn.Cmd{Argv: []str{exe, "agent"}, Env: spawn.Env.Inherit, Dir: "/", Stdin: spawn.Stdio.Null, Stdout: spawn.Stdio.File(home.AgentLog()), Stderr: spawn.Stdio.File(home.AgentLog()), MaxOutput: 0, Input: ""})
+	}
+	mut waited = 0
+	for waited < 50 && !Running() {
+		tide.Sleep(100 * tide.Millisecond)
+		waited += 1
+	}
+	if !Running() {
+		fail "the agent did not start: see {home.AgentLog()}"
+	}
+}
+
+// Stop stops the agent and removes the login item, so nothing of tinbox runs. It reports whether anything ran.
+fn Stop() !bool {
+	mut was = Running()
+	if launchd() {
+		let u = try uid()
+		let r = run([]str{"/bin/launchctl", "bootout", "gui/" + u + "/" + Label}) catch _ {
+			spawn.Result{Code: 1, Stdout: "", Stderr: ""}
+		}
+		if r.Code == 0 {
+			was = true
+		}
+		let p = plistPath()
+		if quarry.Exists(p) {
+			try quarry.Remove(p)
+			was = true
+		}
+	}
+	let s = ReadStatus()
+	if s != nil && s.Pid > 0 && s.Pid != quarry.Pid() && quarry.Alive(s.Pid) {
+		_ = run([]str{"/bin/kill", "-TERM", "{s.Pid}"}) catch _ {
+			spawn.Result{Code: 1, Stdout: "", Stderr: ""}
+		}
+		mut waited = 0
+		for waited < 30 && quarry.Alive(s.Pid) {
+			tide.Sleep(100 * tide.Millisecond)
+			waited += 1
+		}
+		was = true
+	}
+	let sp = home.StatusPath()
+	if quarry.Exists(sp) {
+		try quarry.Remove(sp)
+	}
+	return was
+}
+
+// Installed reports whether the login item is in place.
+fn Installed() bool {
+	return launchd() && quarry.Exists(plistPath())
+}

@@ -1,0 +1,45 @@
+package local
+
+import "../../proto"
+import "crucible"
+import "quarry"
+
+fn TestGlob(t mut crucible.T) {
+	t.True("star", glob("._*", "._foo"))
+	t.True("exact", glob(".DS_Store", ".DS_Store"))
+	t.True("not", !glob("*.log", "a.txt"))
+	t.True("middle", glob("a*c", "abbbc"))
+	t.True("question", glob("a?c", "abc"))
+}
+
+fn TestScan(t mut crucible.T) {
+	let root = "/tmp/tin-test-tinbox-cli-scan"
+	quarry.RemoveAll(root) catch _ {
+	}
+	quarry.MkdirAll(root + "/Docs/Sub") catch _ {
+	}
+	quarry.WriteFile(root + "/Docs/a.txt", "hello") catch _ {
+	}
+	quarry.WriteFile(root + "/.DS_Store", "x") catch _ {
+	}
+	quarry.WriteFile(root + "/big.bin", "0123456789") catch _ {
+	}
+	quarry.WriteFile(root + "/.tinboxignore", "*.log\n") catch _ {
+	}
+	quarry.WriteFile(root + "/x.log", "log") catch _ {
+	}
+	let es = Scan(root, LoadRules(root), map[str]Cached{}, 8) catch err {
+		t.Error("scan: {err}")
+		return
+	}
+	crucible.Equal(mut t, "entries", len(es), 5)
+	t.True("over the limit", es["big.bin"].Over)
+	let want = proto.FileHash([]str{proto.BlockHash("hello")}) catch _ { "" }
+	crucible.Equal(mut t, "hash", es["Docs/a.txt"].Hash, want)
+	let (_, ds) = es[".DS_Store"]
+	t.True("ignored", !ds)
+	let (_, lg) = es["x.log"]
+	t.True("ignored by .tinboxignore", !lg)
+	let h = RootHash(es) catch _ { "" }
+	t.True("a root hash", len(h) == 64)
+}

@@ -1,0 +1,15 @@
+package ui
+
+import "crucible"
+
+fn TestFormat(t mut crucible.T) {
+	crucible.Equal(mut t, "count", Count(1284), "1,284")
+	crucible.Equal(mut t, "small count", Count(12), "12")
+	crucible.Equal(mut t, "size", Size(2202009), "2.1 MB")
+	crucible.Equal(mut t, "big size", Size(327155712), "312 MB")
+	crucible.Equal(mut t, "rate", Rate(6250), "50 kbps")
+	crucible.Equal(mut t, "fast", Rate(1500000), "12 Mbps")
+	crucible.Equal(mut t, "eta", Eta(450000, 6250), "1m 12s left")
+	crucible.Equal(mut t, "visible width ignores colour", visible("\x1b[32m✓\x1b[0m ok"), 4)
+	crucible.Equal(mut t, "clip", Clip("5c7e09ab-1f2d-4e3c-8b9a-77d0c1e2f3a4-8080.example.app", 20), "5c7e09ab-…xample.app")
+}

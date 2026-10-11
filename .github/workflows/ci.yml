@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  macos:
+    name: macOS (Apple silicon)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/tinbox/tin
+          key: tin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('TIN_VERSION') }}
+      - name: Unit tests and builds
+        run: scripts/test.sh
+      - name: The CLI runs
+        run: bin/tinbox help && bin/tinbox config
+
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/tinbox/tin
+          key: tin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('TIN_VERSION') }}
+      - name: Unit tests and builds
+        run: scripts/test.sh
+      - name: install.sh is valid shell
+        run: sh -n install.sh

@@ -1,0 +1,11 @@
+package home
+
+import "crucible"
+
+fn TestPaths(t mut crucible.T) {
+	let a = Absolute("/a/b/../c/./d/") catch _ { "" }
+	crucible.Equal(mut t, "clean", a, "/a/c/d")
+	t.True("within", Within("/x/y", "/x/y/z"))
+	t.True("itself", Within("/x/y", "/x/y"))
+	t.True("not a prefix of a name", !Within("/x/y", "/x/yz"))
+}

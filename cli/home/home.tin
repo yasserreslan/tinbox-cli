@@ -1,0 +1,200 @@
+package home
+
+import "argo"
+import "constraints"
+import "fault"
+import "quarry"
+import "twine"
+
+// Where the CLI keeps its own files: ~/.config/tinbox (TINBOX_HOME overrides it), readable by you alone. It holds the
+// sign-in (this Mac's key), the settings, the linked folders, and the agent's status, activity log and output.
+
+// ErrSignedOut is the fault of a command that needs a signed-in Mac.
+let ErrSignedOut = fault("this Mac is not signed in: run tinbox login")
+
+// Dir is the CLI's directory.
+fn Dir() str {
+	let set = quarry.Getenv("TINBOX_HOME")
+	if len(set) > 0 {
+		return twine.TrimRight(set, "/")
+	}
+	return quarry.Getenv("HOME") + "/.config/tinbox"
+}
+
+// Ensure makes the directory, for this user only.
+fn Ensure() ! {
+	let d = Dir()
+	try quarry.MkdirAll(d)
+	try quarry.Chmod(d, 0o700)
+}
+
+fn path(name str) str {
+	return Dir() + "/" + name
+}
+
+// StatusPath is the agent's status file, rewritten every second while it runs.
+fn StatusPath() str {
+	return path("status.json")
+}
+
+// ActivityPath is the log of what was synced, one line per change.
+fn ActivityPath() str {
+	return path("activity.log")
+}
+
+// AgentLog is where the background agent's output goes.
+fn AgentLog() str {
+	return path("agent.log")
+}
+
+// SettingsPath is the settings every folder uses unless it overrides them.
+fn SettingsPath() str {
+	return path("settings")
+}
+
+// WriteAtomic writes data to a temporary file beside path, sets perm, and renames it over path.
+fn WriteAtomic(p str, data str, perm i64) ! {
+	let tmp = p + ".tmp"
+	try quarry.WriteFile(tmp, data)
+	try quarry.Chmod(tmp, perm)
+	try quarry.Rename(tmp, p)
+}
+
+fn encode[T constraints.Any](v T) str {
+	mut b = make([]u8, 0, 1024)
+	argo.Put(mut b, v)
+	return str(b)
+}
+
+// Credentials is this Mac's sign-in: the server, its device and user, and the ed25519 seed of its key (base64).
+type Credentials struct {
+	@json("server") Server str
+	@json("device") Device i64
+	@json("device_name") DeviceName str
+	@json("user") User i64
+	@json("email") Email str
+	@json("name") Name str
+	@json("seed") Seed str
+}
+
+fn credentialsPath() str {
+	return path("credentials.json")
+}
+
+// LoadCredentials is the sign-in, nil when this Mac is not signed in.
+fn LoadCredentials() !?Credentials {
+	let p = credentialsPath()
+	if !quarry.Exists(p) {
+		return nil
+	}
+	let text = try quarry.ReadFileBound(p, 65536)
+	mut c = Credentials{Server: "", Device: 0, DeviceName: "", User: 0, Email: "", Name: "", Seed: ""}
+	try argo.Get(text, mut c) wrap "reading {p}"
+	return c
+}
+
+// MustCredentials is the sign-in, or ErrSignedOut.
+fn MustCredentials() !Credentials {
+	let c = try LoadCredentials()
+	if c == nil {
+		fail ErrSignedOut
+	}
+	return c
+}
+
+// SaveCredentials writes the sign-in, readable by this user alone.
+fn SaveCredentials(c Credentials) ! {
+	try Ensure()
+	try WriteAtomic(credentialsPath(), encode(c), 0o600)
+}
+
+// RemoveCredentials forgets the sign-in.
+fn RemoveCredentials() ! {
+	let p = credentialsPath()
+	if quarry.Exists(p) {
+		try quarry.Remove(p)
+	}
+}
+
+// Folder is one linked folder: its absolute path and its team.
+type Folder struct {
+	@json("path") Path str
+	@json("team") Team i64
+	@json("team_name") TeamName str
+	@json("paused") Paused bool
+}
+
+// FoldersFile is the list of linked folders.
+type FoldersFile struct {
+	@json("folders") Folders []Folder
+	@json("paused") Paused bool
+}
+
+fn foldersPath() str {
+	return path("folders.json")
+}
+
+// LoadFolders is every linked folder, and whether all syncing is paused.
+fn LoadFolders() !FoldersFile {
+	let p = foldersPath()
+	mut f = FoldersFile{Folders: []Folder{}, Paused: false}
+	if !quarry.Exists(p) {
+		return f
+	}
+	let text = try quarry.ReadFileBound(p, 4194304)
+	try argo.Get(text, mut f) wrap "reading {p}"
+	return f
+}
+
+// SaveFolders writes the list of linked folders.
+fn SaveFolders(f FoldersFile) ! {
+	try Ensure()
+	try WriteAtomic(foldersPath(), encode(f), 0o600)
+}
+
+// Within reports whether path is dir or inside it.
+fn Within(dir str, p str) bool {
+	return p == dir || twine.HasPrefix(p, dir + "/")
+}
+
+// FolderOf is the linked folder that holds path, nil when none does.
+fn FolderOf(f FoldersFile, p str) ?Folder {
+	for x in f.Folders {
+		if Within(x.Path, p) {
+			return x
+		}
+	}
+	return nil
+}
+
+// Tilde writes a path under the home directory as ~/...
+fn Tilde(p str) str {
+	let h = quarry.Getenv("HOME")
+	if len(h) > 0 && Within(h, p) {
+		return "~" + p[len(h):]
+	}
+	return p
+}
+
+// Absolute is p made absolute against the working directory, with no trailing slash.
+fn Absolute(p str) !str {
+	mut out = p
+	if len(p) == 0 || p[0] != '/' {
+		let wd = try quarry.Getwd()
+		out = wd + "/" + p
+	}
+	mut parts = []str{}
+	for seg in twine.Split(out, "/") {
+		if len(seg) == 0 || seg == "." {
+			continue
+		}
+		if seg == ".." {
+			if len(parts) > 0 {
+				parts = parts[0:len(parts) - 1]
+			}
+			continue
+		}
+		parts = append(parts, seg)
+	}
+	return "/" + twine.Join(parts, "/")
+}

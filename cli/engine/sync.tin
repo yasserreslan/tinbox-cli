@@ -1,0 +1,1096 @@
+package engine
+
+import "../../proto"
+import "../api"
+import "../home"
+import "../local"
+import "../settings"
+import "argo"
+import "fault"
+import "quarry"
+import "say"
+import "seal"
+import "sift"
+import "tide"
+import "twine"
+
+// One sync cycle of a linked folder (design/backend.md, "Three trees"): pull the server's changes, scan the disk,
+// and decide each path from three states (local, remote, and the base both last agreed on). A change on one side is
+// sent to the other; changes on both sides that agree are adopted; edits win over deletes; two different edits keep
+// both, the local one as a conflicted copy. When the base cannot be trusted (a first sync, a new epoch, a journal
+// reset) nothing is deleted on either side.
+
+// Progress is what a cycle is doing, in <folder>/.tinbox/progress.json for the status view.
+type Progress struct {
+	@json("phase") Phase str
+	@json("path") Path str
+	@json("done") Done i64
+	@json("total") Total i64
+	@json("rate") Rate i64
+	@json("pending_up") PendingUp i64
+	@json("pending_down") PendingDown i64
+	@json("at") At i64
+}
+
+// Options are how a cycle runs: Confirm sends deletes the server holds back, Device names conflicted copies, Echo
+// prints progress lines (for tinbox sync).
+type Options struct {
+	Confirm bool
+	Device  str
+	Echo    bool
+}
+
+// Meter keeps a cycle's progress and writes it at most twice a second.
+type Meter struct {
+	root        str
+	echo        bool
+	phase       str
+	path        str
+	done        i64
+	total       i64
+	began       i64
+	last        i64
+	echoed      i64
+	pendingUp   i64
+	pendingDown i64
+}
+
+fn progressPath(root str) str {
+	return Dir(root) + "/progress.json"
+}
+
+fn (m mut Meter) start(phase str, path str, total i64) {
+	m.phase = phase
+	m.path = path
+	m.total = total
+	m.done = 0
+	m.began = tide.Now()
+	m.flush(true)
+}
+
+fn (m mut Meter) add(n i64) {
+	m.done += n
+	m.flush(m.total > 0 && m.done >= m.total)
+}
+
+fn (m Meter) rate() i64 {
+	let ms = max(tide.Since(m.began) / tide.Millisecond, 1)
+	return m.done * 1000 / ms
+}
+
+fn (m mut Meter) flush(now bool) {
+	let t = tide.Now()
+	if !now && t - m.last < 500 * tide.Millisecond {
+		return
+	}
+	m.last = t
+	let p = Progress{Phase: m.phase, Path: m.path, Done: m.done, Total: m.total, Rate: m.rate(), PendingUp: m.pendingUp, PendingDown: m.pendingDown, At: tide.Wall() / tide.Second}
+	mut b = make([]u8, 0, 256)
+	argo.Put(mut b, p)
+	home.WriteAtomic(progressPath(m.root), str(b), 0o600) catch _ {
+	}
+	let finished = m.total > 0 && m.done >= m.total
+	let moving = m.done > 0 && t - m.echoed > 2 * tide.Second
+	if m.echo && (m.phase == "uploading" || m.phase == "downloading") && (finished || moving) {
+		m.echoed = t
+		mut arrow = "↓"
+		if m.phase == "uploading" {
+			arrow = "↑"
+		}
+		mut pct = 0
+		if m.total > 0 {
+			pct = m.done * 100 / m.total
+		}
+		say.Line("  {arrow} {m.path}  {pct}%  {m.rate() * 8 / 1000} kbps")
+	}
+}
+
+// ReadProgress is what a folder's cycle is doing now, nil when nothing recent was written.
+fn ReadProgress(root str) ?Progress {
+	let text = quarry.ReadFileBound(progressPath(root), 65536) catch _ {
+		return nil
+	}
+	mut p = Progress{Phase: "", Path: "", Done: 0, Total: 0, Rate: 0, PendingUp: 0, PendingDown: 0, At: 0}
+	argo.Get(text, mut p) catch _ {
+		return nil
+	}
+	if tide.Wall() / tide.Second - p.At > 15 {
+		return nil
+	}
+	return p
+}
+
+// Report is what a cycle did.
+type Report struct {
+	Uploaded     i64
+	Downloaded   i64
+	DeletedHere  i64
+	DeletedThere i64
+	Conflicts    []str
+	Skipped      []str
+	Waiting      i64
+	Verified     bool
+	Files        i64
+	Bytes        i64
+	Errors       []str
+}
+
+// MaxOps is the most changes one commit carries.
+const MaxOps = 500
+
+// GuardEmpty: a folder with no files left while its base had at least this many is not emptied on the server.
+const GuardEmpty = 5
+
+fn key(p str) str {
+	return twine.ToLower(p)
+}
+
+fn emptyEntry() local.Entry {
+	return local.Entry{Path: "", Kind: 0, Size: 0, Mtime: 0, Inode: 0, Hash: "", Blocks: []str{}, Over: false}
+}
+
+fn emptyNode() RNode {
+	return RNode{Id: 0, Parent: 0, Name: "", Kind: 0, Hash: "", Size: 0, Rev: 0, PlaceRev: 0, Blocks: []str{}}
+}
+
+fn emptyBase() Base {
+	return Base{Path: "", Id: 0, Kind: 0, Hash: "", Size: 0, Mtime: 0, Inode: 0, Blocks: []str{}}
+}
+
+fn activity(root str, mark str, p str) {
+	let line = "{tide.Wall() / tide.Second}\t{root}\t{mark}\t{p}\n"
+	home.Ensure() catch _ {
+	}
+	quarry.AppendFile(home.ActivityPath(), line) catch _ {
+	}
+}
+
+// ---- pulling the server's changes ----
+
+fn applyEntry(st mut State, e proto.Entry) {
+	if e.Deleted {
+		delete(st.Remote, e.Node)
+		return
+	}
+	st.Remote[e.Node] = RNode{Id: e.Node, Parent: e.Parent, Name: e.Name, Kind: e.Kind, Hash: e.Hash, Size: e.Size, Rev: e.Rev, PlaceRev: e.PlaceRev, Blocks: e.Blocks}
+}
+
+fn snapshot(c mut api.Client, st mut State) ! {
+	st.Remote = map[i64]RNode{}
+	mut after = 0
+	mut seq = -1
+	for {
+		let s = try api.Snapshot(mut c, st.Team, after)
+		if seq < 0 {
+			seq = s.Seq
+		}
+		for n in s.Nodes {
+			st.Remote[n.Id] = RNode{Id: n.Id, Parent: n.Parent, Name: n.Name, Kind: n.Kind, Hash: n.Hash, Size: n.Size, Rev: n.Rev, PlaceRev: n.PlaceRev, Blocks: n.Blocks}
+		}
+		if !s.More {
+			break
+		}
+		after = s.Next
+	}
+	st.Cursor = seq
+}
+
+// pull brings the server's tree up to date and reports whether the base must not be trusted this cycle.
+fn pull(c mut api.Client, st mut State) !(bool, proto.HeadOut) {
+	let h = try api.Head(mut c, st.Team)
+	mut unsafe = false
+	if len(st.Epoch) > 0 && h.Epoch != st.Epoch {
+		unsafe = true
+		st.Cursor = 0
+	}
+	st.Epoch = h.Epoch
+	st.Root = h.Root
+	if st.Cursor == 0 || st.Cursor < h.Floor {
+		if st.Cursor > 0 {
+			unsafe = true
+		}
+		try snapshot(mut c, mut st)
+	}
+	mut resets = 0
+	for {
+		let d = try api.Delta(mut c, st.Team, st.Cursor)
+		if d.Reset {
+			resets += 1
+			if resets > 2 {
+				fail "the server keeps resetting the journal"
+			}
+			unsafe = true
+			try snapshot(mut c, mut st)
+			continue
+		}
+		for e in d.Entries {
+			applyEntry(mut st, e)
+		}
+		st.Cursor = d.Cursor
+		if !d.More {
+			break
+		}
+	}
+	return unsafe, h
+}
+
+// remoteByKey is the server's tree by path (lower case), without the root; nodes cut off from the root are left out.
+fn remoteByKey(st State) (map[str]RNode, map[str]str) {
+	mut paths = map[i64]str{}
+	paths[st.Root] = ""
+	mut out = map[str]RNode{}
+	mut real = map[str]str{}
+	for id, n in st.Remote {
+		if id == st.Root {
+			continue
+		}
+		// walk up to a known path
+		mut chain = []i64{}
+		mut cur = id
+		mut ok = true
+		for {
+			let (_, known) = paths[cur]
+			if known {
+				break
+			}
+			let (node, exists) = st.Remote[cur]
+			if !exists || len(chain) > 4096 {
+				ok = false
+				break
+			}
+			chain = append(chain, cur)
+			cur = node.Parent
+		}
+		if !ok {
+			continue
+		}
+		mut i = len(chain) - 1
+		for i >= 0 {
+			let nid = chain[i]
+			let node = st.Remote[nid]
+			let parent = paths[node.Parent]
+			mut p = node.Name
+			if len(parent) > 0 {
+				p = parent + "/" + node.Name
+			}
+			paths[nid] = p
+			i -= 1
+		}
+		let p = paths[id]
+		out[key(p)] = n
+		real[key(p)] = p
+	}
+	return out, real
+}
+
+// ---- deciding ----
+
+// Plan is the decision for one path.
+type Plan struct {
+	Key  str
+	Path str
+	Do   str
+	L    local.Entry
+	R    RNode
+	B    Base
+	HasL bool
+	HasR bool
+	HasB bool
+}
+
+fn sameContent(l local.Entry, r RNode) bool {
+	return l.Kind == r.Kind && (l.Kind == proto.KindDir || l.Hash == r.Hash)
+}
+
+fn localChanged(l local.Entry, hasL bool, b Base, hasB bool) bool {
+	if hasL != hasB {
+		return true
+	}
+	if !hasL {
+		return false
+	}
+	return l.Kind != b.Kind || (l.Kind != proto.KindDir && l.Hash != b.Hash)
+}
+
+fn remoteChanged(r RNode, hasR bool, b Base, hasB bool) bool {
+	if hasR != hasB {
+		return true
+	}
+	if !hasR {
+		return false
+	}
+	return r.Kind != b.Kind || (r.Kind != proto.KindDir && r.Hash != b.Hash)
+}
+
+fn decide(p mut Plan) {
+	let lc = localChanged(p.L, p.HasL, p.B, p.HasB)
+	let rc = remoteChanged(p.R, p.HasR, p.B, p.HasB)
+	if !lc && !rc {
+		p.Do = "none"
+		if p.HasL && p.HasR && !sameBase(p) {
+			p.Do = "adopt"
+		}
+		return
+	}
+	if lc && !rc {
+		if p.HasL && !p.HasR {
+			p.Do = "push-create"
+		} else if p.HasL && p.HasR {
+			if p.L.Kind == proto.KindDir && p.R.Kind == proto.KindDir {
+				p.Do = "adopt"
+			} else if p.L.Kind != proto.KindDir && p.R.Kind != proto.KindDir {
+				p.Do = "push-modify"
+			} else {
+				p.Do = "conflict"
+			}
+		} else if !p.HasL && p.HasR {
+			p.Do = "push-delete"
+		} else {
+			p.Do = "drop"
+		}
+		return
+	}
+	if !lc && rc {
+		if p.HasR && !p.HasL {
+			p.Do = "pull-create"
+		} else if p.HasR && p.HasL {
+			if p.L.Kind == proto.KindDir && p.R.Kind == proto.KindDir {
+				p.Do = "adopt"
+			} else if p.L.Kind != proto.KindDir && p.R.Kind != proto.KindDir {
+				p.Do = "pull-modify"
+			} else {
+				p.Do = "conflict"
+			}
+		} else if !p.HasR && p.HasL {
+			p.Do = "pull-delete"
+		} else {
+			p.Do = "drop"
+		}
+		return
+	}
+	// both sides changed
+	if p.HasL && p.HasR && sameContent(p.L, p.R) {
+		p.Do = "adopt"
+	} else if !p.HasL && !p.HasR {
+		p.Do = "drop"
+	} else if !p.HasL && p.HasR {
+		p.Do = "pull-create"
+	} else if p.HasL && !p.HasR {
+		p.Do = "push-create"
+	} else if p.L.Kind == proto.KindDir && p.R.Kind == proto.KindDir {
+		p.Do = "adopt"
+	} else {
+		p.Do = "conflict"
+	}
+}
+
+fn sameBase(p Plan) bool {
+	return p.HasB && p.B.Id == p.R.Id && p.B.Hash == p.R.Hash && p.B.Kind == p.R.Kind
+}
+
+fn depthOf(p str) i64 {
+	return twine.Count(p, "/")
+}
+
+fn byDepth(a Plan, b Plan) i64 {
+	let d = depthOf(a.Path) - depthOf(b.Path)
+	if d != 0 {
+		return d
+	}
+	return twine.Compare(a.Key, b.Key)
+}
+
+fn under(dir str, k str) bool {
+	return twine.HasPrefix(k, dir + "/")
+}
+
+// ---- the cycle ----
+
+// Cycle syncs one linked folder once. confirm sends deletes the server holds back for confirmation.
+fn Cycle(root str, c mut api.Client, s settings.Settings, opts Options) !Report {
+	let device = opts.Device
+	let confirm = opts.Confirm
+	mut meter = Meter{root: root, echo: opts.Echo, phase: "", path: "", done: 0, total: 0, began: tide.Now(), last: 0, echoed: 0, pendingUp: 0, pendingDown: 0}
+	mut st = try Load(root)
+	mut rep = Report{Uploaded: 0, Downloaded: 0, DeletedHere: 0, DeletedThere: 0, Conflicts: []str{}, Skipped: []str{}, Waiting: 0, Verified: false, Files: 0, Bytes: 0, Errors: []str{}}
+	let (inode, dev) = try local.RootID(root)
+	if st.RootInode != 0 && (inode != st.RootInode || dev != st.RootDevice) {
+		fail fault.Wrap(local.ErrUnsafe, "{root} is not the folder that was linked (another disk or a replaced folder): run tinbox init there again")
+	}
+	meter.start("checking", "", 0)
+	let (unsafe, head) = try pull(mut c, mut st)
+	let (remote, remotePath) = remoteByKey(st)
+	// scan, with the base as the hash cache
+	mut cache = map[str]local.Cached{}
+	for k, b in st.Base {
+		if b.Kind != proto.KindDir {
+			cache[b.Path] = local.Cached{Size: b.Size, Mtime: b.Mtime, Inode: b.Inode, Hash: b.Hash, Blocks: b.Blocks}
+		}
+	}
+	let scanStart = tide.Wall()
+	let scanned = try local.Scan(root, local.LoadRules(root), cache, s.MaxFileSize)
+	mut here = map[str]local.Entry{}
+	for p, e in scanned {
+		here[key(p)] = e
+	}
+	// plan every path
+	mut keys = map[str]bool{}
+	for k, _ in here {
+		keys[k] = true
+	}
+	for k, _ in remote {
+		keys[k] = true
+	}
+	for k, _ in st.Base {
+		keys[k] = true
+	}
+	mut plans = []Plan{}
+	for k, _ in keys {
+		let (l, hasL) = here[k]
+		let (r, hasR) = remote[k]
+		let (b, hasB0) = st.Base[k]
+		mut p = Plan{Key: k, Path: "", Do: "none", L: emptyEntry(), R: emptyNode(), B: emptyBase(), HasL: hasL, HasR: hasR, HasB: hasB0 && !unsafe}
+		if hasL {
+			p.L = l
+			p.Path = l.Path
+		}
+		if hasR {
+			p.R = r
+			if len(p.Path) == 0 {
+				p.Path = remotePath[k]
+			}
+		}
+		if hasB0 {
+			p.B = b
+			if len(p.Path) == 0 {
+				p.Path = b.Path
+			}
+		}
+		if hasL && l.Over {
+			rep.Skipped = append(rep.Skipped, l.Path)
+			continue
+		}
+		decide(mut p)
+		plans = append(plans, p)
+	}
+	sift.SortFunc(mut plans, byDepth)
+	// new local content under a folder the server deleted brings the folder back (edits win)
+	mut index = map[str]i64{}
+	for i, p in plans {
+		index[p.Key] = i
+	}
+	for i in 0..len(plans) {
+		let p = plans[i]
+		if p.Do != "push-create" && p.Do != "push-modify" {
+			continue
+		}
+		mut parent = key(local.Parent(p.Path))
+		for len(parent) > 0 {
+			let (j, ok) = index[parent]
+			if ok && plans[j].Do == "pull-delete" {
+				plans[j].Do = "push-create"
+			}
+			parent = key(local.Parent(parent))
+		}
+	}
+	// a folder deleted here is deleted on the server whole, but only when nothing under it changed there
+	for i in 0..len(plans) {
+		if plans[i].Do != "push-delete" || plans[i].R.Kind != proto.KindDir {
+			continue
+		}
+		let dk = plans[i].Key
+		mut whole = true
+		for q in plans {
+			if under(dk, q.Key) && q.HasR && q.Do != "push-delete" {
+				whole = false
+			}
+		}
+		if whole {
+			for j in 0..len(plans) {
+				if under(dk, plans[j].Key) && plans[j].Do == "push-delete" {
+					plans[j].Do = "covered"
+				}
+			}
+		} else {
+			plans[i].Do = "keep"
+		}
+	}
+	// an emptied folder (an unmounted disk, a wiped directory) is not emptied on the server
+	mut files = 0
+	for _, e in here {
+		if e.Kind != proto.KindDir {
+			files += 1
+		}
+	}
+	if files == 0 && len(st.Base) >= GuardEmpty && !confirm {
+		mut held = 0
+		for i in 0..len(plans) {
+			if plans[i].Do == "push-delete" || plans[i].Do == "covered" {
+				plans[i].Do = "held"
+				held += 1
+			}
+		}
+		if held > 0 {
+			rep.Waiting += held
+			rep.Errors = append(rep.Errors, "the folder is empty: {held} deletes held back (tinbox sync --confirm-deletes sends them)")
+		}
+	}
+	mut pendingUp = 0
+	mut pendingDown = 0
+	for p in plans {
+		if p.Do == "push-create" || p.Do == "push-modify" || p.Do == "conflict" {
+			pendingUp += 1
+		}
+		if p.Do == "pull-create" || p.Do == "pull-modify" || p.Do == "conflict" {
+			pendingDown += 1
+		}
+	}
+	// conflicts: keep the local version as a conflicted copy (uploaded as a new file), then take the server's
+	for i in 0..len(plans) {
+		if plans[i].Do != "conflict" {
+			continue
+		}
+		let p = plans[i]
+		if !p.HasL || !p.HasR {
+			plans[i].Do = "none"
+			continue
+		}
+		let copy = conflictName(p.Path, device)
+		quarry.Rename(root + "/" + p.Path, root + "/" + copy) catch err {
+			rep.Errors = append(rep.Errors, "{p.Path}: keeping a conflicted copy: {fault.Message(err)}")
+			plans[i].Do = "none"
+			continue
+		}
+		activity(root, "!", copy)
+		rep.Conflicts = append(rep.Conflicts, copy)
+		mut moved = p.L
+		moved.Path = copy
+		plans = append(plans, Plan{Key: key(copy), Path: copy, Do: "push-create", L: moved, R: emptyNode(), B: emptyBase(), HasL: true, HasR: false, HasB: false})
+		plans[i].Do = "pull-modify"
+		plans[i].HasL = false
+	}
+	sift.SortFunc(mut plans, byDepth)
+	// to the server: folders, then files, then deletes
+	mut ids = map[str]i64{}
+	for k, r in remote {
+		ids[k] = r.Id
+	}
+	ids[""] = st.Root
+	try pushFolders(mut c, mut st, plans, mut ids, mut rep)
+	meter.pendingUp = pendingUp
+	meter.pendingDown = pendingDown
+	try pushFiles(root, mut c, mut st, plans, ids, s, scanStart, mut rep, mut meter)
+	try pushDeletes(mut c, mut st, plans, confirm, mut rep)
+	// from the server: folders, files, then deletes deepest first
+	try pullAll(root, mut c, mut st, plans, s, mut rep, mut meter)
+	// the rest only moves the base
+	for p in plans {
+		if p.Do == "adopt" {
+			st.Base[p.Key] = baseOf(p.L, p.R, scanStart)
+		} else if p.Do == "drop" {
+			delete(st.Base, p.Key)
+		}
+	}
+	// account
+	mut bytes = 0
+	for _, e in here {
+		if e.Kind != proto.KindDir && !e.Over {
+			bytes += e.Size
+		}
+	}
+	rep.Files = files - len(rep.Skipped)
+	rep.Bytes = bytes
+	mut busy = false
+	for p in plans {
+		if p.Do != "none" && p.Do != "adopt" && p.Do != "drop" && p.Do != "keep" {
+			busy = true
+		}
+	}
+	if !busy && len(rep.Skipped) == 0 {
+		let mine = local.RootHash(scanned) catch _ {
+			""
+		}
+		rep.Verified = mine == head.RootHash
+	}
+	st.LastSync = tide.Wall() / tide.Second
+	st.Verified = rep.Verified
+	st.Files = rep.Files
+	st.Bytes = rep.Bytes
+	st.Skipped = rep.Skipped
+	if len(rep.Conflicts) > 0 {
+		st.Conflicts = rep.Conflicts
+	}
+	st.Waiting = rep.Waiting
+	st.LastError = twine.Join(rep.Errors, "; ")
+	try Save(root, st)
+	meter.pendingUp = 0
+	meter.pendingDown = 0
+	meter.start("idle", "", 0)
+	return rep
+}
+
+fn baseOf(l local.Entry, r RNode, scanStart i64) Base {
+	mut mtime = l.Mtime
+	// a file changed in the second before the scan may change again without its mtime moving: hash it next time
+	if mtime >= scanStart - 2 * tide.Second {
+		mtime = 0
+	}
+	return Base{Path: l.Path, Id: r.Id, Kind: r.Kind, Hash: r.Hash, Size: r.Size, Mtime: mtime, Inode: l.Inode, Blocks: r.Blocks}
+}
+
+// conflictName is "name (conflicted copy, DEVICE, 2026-10-11).ext" beside p.
+fn conflictName(p str, device str) str {
+	let dir = local.Parent(p)
+	let name = local.Base(p)
+	mut stem = name
+	mut ext = ""
+	let dot = twine.LastIndex(name, ".")
+	if dot > 0 {
+		stem = name[0:dot]
+		ext = name[dot:]
+	}
+	let day = tide.Format(tide.Wall(), tide.Local(), "2006-01-02 1504")
+	let copy = "{stem} (conflicted copy, {device}, {day}){ext}"
+	if len(dir) == 0 {
+		return copy
+	}
+	return dir + "/" + copy
+}
+
+fn parentId(ids map[str]i64, p str) i64 {
+	let (id, ok) = ids[key(local.Parent(p))]
+	if !ok {
+		return 0
+	}
+	return id
+}
+
+fn record(st mut State, k str, b Base, r RNode) {
+	st.Base[k] = b
+	st.Remote[r.Id] = r
+}
+
+// pushFolders makes the folders that are new here, a level at a time so each knows its parent's id.
+fn pushFolders(c mut api.Client, st mut State, plans []Plan, ids mut map[str]i64, rep mut Report) ! {
+	mut level = 0
+	for {
+		mut ops = []api.Op{}
+		mut which = []Plan{}
+		mut deeper = false
+		for p in plans {
+			if p.Do != "push-create" || p.L.Kind != proto.KindDir {
+				continue
+			}
+			let d = depthOf(p.Path)
+			if d > level {
+				deeper = true
+				continue
+			}
+			if d < level {
+				continue
+			}
+			let parent = parentId(ids, p.Path)
+			if parent == 0 {
+				continue
+			}
+			mut op = api.NewOp("mkdir")
+			op.Parent = parent
+			op.Name = local.Base(p.Path)
+			ops = append(ops, op)
+			which = append(which, p)
+		}
+		mut start = 0
+		for start < len(ops) {
+			let end = min(start + MaxOps, len(ops))
+			let out = try api.Commit(mut c, st.Team, ops[start:end], false)
+			for i, r in out.Results {
+				let p = which[start + i]
+				if r.Status == "ok" || (r.Status == "name_taken" && r.Node > 0) {
+					ids[p.Key] = r.Node
+					let node = RNode{Id: r.Node, Parent: parentId(ids, p.Path), Name: local.Base(p.Path), Kind: proto.KindDir, Hash: r.Hash, Size: 0, Rev: r.Rev, PlaceRev: r.PlaceRev, Blocks: []str{}}
+					record(mut st, p.Key, Base{Path: p.Path, Id: r.Node, Kind: proto.KindDir, Hash: "", Size: 0, Mtime: 0, Inode: p.L.Inode, Blocks: []str{}}, node)
+				} else {
+					rep.Errors = append(rep.Errors, "{p.Path}: {r.Status} {r.Message}")
+				}
+			}
+			start = end
+		}
+		if !deeper {
+			return
+		}
+		level += 1
+	}
+}
+
+// upload sends one block, whole, or in parts that keep the upload speed under rate.
+fn upload(c mut api.Client, team i64, hash str, data str, rate i64, meter mut Meter) ! {
+	if rate <= 0 {
+		try api.PutBlock(mut c, team, hash, data)
+		meter.add(len(data))
+		return
+	}
+	let part = max(4096, min(1048576, rate * 2))
+	mut off = 0
+	mut n = 0
+	for off < len(data) {
+		let end = min(off + part, len(data))
+		let started = tide.Now()
+		try api.PutPart(mut c, team, hash, n, data[off:end])
+		let want = (end - off) * tide.Second / rate
+		let took = tide.Since(started)
+		if took < want {
+			tide.Sleep(want - took)
+		}
+		// counted after the pause, so the speed shown is the speed kept
+		meter.add(end - off)
+		off = end
+		n += 1
+	}
+	try api.CompleteUpload(mut c, team, hash, n)
+}
+
+// pushFiles uploads the blocks the server lacks, then commits the new and changed files.
+fn pushFiles(root str, c mut api.Client, st mut State, plans []Plan, ids map[str]i64, s settings.Settings, scanStart i64, rep mut Report, meter mut Meter) ! {
+	mut todo = []Plan{}
+	mut hashes = []str{}
+	mut seen = map[str]bool{}
+	for p in plans {
+		if (p.Do == "push-create" || p.Do == "push-modify") && p.L.Kind != proto.KindDir {
+			todo = append(todo, p)
+			for b in p.L.Blocks {
+				if !seen[b] {
+					seen[b] = true
+					hashes = append(hashes, b)
+				}
+			}
+		}
+	}
+	if len(todo) == 0 {
+		return
+	}
+	mut missing = map[str]bool{}
+	mut start = 0
+	for start < len(hashes) {
+		let end = min(start + 1000, len(hashes))
+		let m = try api.Missing(mut c, st.Team, hashes[start:end])
+		for h in m {
+			missing[h] = true
+		}
+		start = end
+	}
+	mut ready = []Plan{}
+	for p in todo {
+		mut total = 0
+		for i, b in p.L.Blocks {
+			if missing[b] {
+				total += min(proto.BlockSize, p.L.Size - i * proto.BlockSize)
+			}
+		}
+		meter.start("uploading", p.Path, total)
+		mut failed = false
+		for i, b in p.L.Blocks {
+			if !missing[b] {
+				continue
+			}
+			let data = local.ReadBlock(root + "/" + p.Path, i, p.L.Size) catch err {
+				rep.Errors = append(rep.Errors, "{p.Path}: {fault.Message(err)}")
+				failed = true
+				break
+			}
+			if proto.BlockHash(data) != b {
+				// changed since the scan: the next cycle sends the new content
+				failed = true
+				break
+			}
+			upload(mut c, st.Team, b, data, s.UploadLimit, mut meter) catch err {
+				rep.Errors = append(rep.Errors, "{p.Path}: uploading: {fault.Message(err)}")
+				failed = true
+				break
+			}
+			missing[b] = false
+		}
+		meter.pendingUp = max(meter.pendingUp - 1, 0)
+		if !failed {
+			ready = append(ready, p)
+		}
+	}
+	mut ops = []api.Op{}
+	mut which = []Plan{}
+	for p in ready {
+		if p.Do == "push-create" {
+			let parent = parentId(ids, p.Path)
+			if parent == 0 {
+				continue
+			}
+			mut op = api.NewOp("create")
+			op.Parent = parent
+			op.Name = local.Base(p.Path)
+			op.Kind = p.L.Kind
+			op.Blocks = p.L.Blocks
+			op.MtimeNs = p.L.Mtime
+			ops = append(ops, op)
+		} else {
+			mut op = api.NewOp("modify")
+			op.Node = p.R.Id
+			op.BaseRev = p.R.Rev
+			op.Kind = p.L.Kind
+			op.Blocks = p.L.Blocks
+			op.MtimeNs = p.L.Mtime
+			ops = append(ops, op)
+		}
+		which = append(which, p)
+	}
+	start = 0
+	for start < len(ops) {
+		let end = min(start + MaxOps, len(ops))
+		let out = try api.Commit(mut c, st.Team, ops[start:end], false)
+		for i, r in out.Results {
+			let p = which[start + i]
+			if r.Status == "ok" {
+				let node = RNode{Id: r.Node, Parent: parentId(ids, p.Path), Name: local.Base(p.Path), Kind: p.L.Kind, Hash: p.L.Hash, Size: p.L.Size, Rev: r.Rev, PlaceRev: r.PlaceRev, Blocks: p.L.Blocks}
+				record(mut st, p.Key, baseOf(p.L, node, scanStart), node)
+				rep.Uploaded += 1
+				activity(root, "↑", p.Path)
+			} else if r.Status != "conflict" && r.Status != "name_taken" {
+				rep.Errors = append(rep.Errors, "{p.Path}: {r.Status} {r.Message}")
+			}
+		}
+		start = end
+	}
+}
+
+// pushDeletes deletes on the server what was deleted here, deepest first.
+fn pushDeletes(c mut api.Client, st mut State, plans []Plan, confirm bool, rep mut Report) ! {
+	mut ops = []api.Op{}
+	mut which = []Plan{}
+	mut i = len(plans) - 1
+	for i >= 0 {
+		let p = plans[i]
+		i -= 1
+		if p.Do != "push-delete" {
+			continue
+		}
+		mut op = api.NewOp("delete")
+		op.Node = p.R.Id
+		if p.R.Kind == proto.KindDir {
+			op.BaseHash = p.R.Hash
+		} else {
+			op.BaseRev = p.R.Rev
+		}
+		ops = append(ops, op)
+		which = append(which, p)
+	}
+	mut start = 0
+	for start < len(ops) {
+		let end = min(start + MaxOps, len(ops))
+		let out = try api.Commit(mut c, st.Team, ops[start:end], confirm)
+		for j, r in out.Results {
+			let p = which[start + j]
+			if r.Status == "ok" {
+				delete(st.Base, p.Key)
+				delete(st.Remote, p.R.Id)
+				if p.R.Kind == proto.KindDir {
+					mut gone = []str{}
+					for k, _ in st.Base {
+						if under(p.Key, k) {
+							gone = append(gone, k)
+						}
+					}
+					for k in gone {
+						delete(st.Base, k)
+					}
+				}
+				rep.DeletedThere += 1
+			} else if r.Status == "confirm_required" {
+				rep.Waiting += 1
+			} else if r.Status != "conflict" && r.Status != "not_found" {
+				rep.Errors = append(rep.Errors, "{p.Path}: {r.Status} {r.Message}")
+			}
+		}
+		start = end
+	}
+	if rep.Waiting > 0 {
+		rep.Errors = append(rep.Errors, "{rep.Waiting} deletes wait for confirmation (tinbox sync --confirm-deletes)")
+	}
+}
+
+// pullAll makes here what the server has new or changed, then deletes here what the server deleted.
+fn pullAll(root str, c mut api.Client, st mut State, plans []Plan, s settings.Settings, rep mut Report, meter mut Meter) ! {
+	for p in plans {
+		if p.Do != "pull-create" && p.Do != "pull-modify" {
+			continue
+		}
+		if p.R.Kind == proto.KindDir {
+			quarry.MkdirAll(root + "/" + p.Path) catch err {
+				rep.Errors = append(rep.Errors, "{p.Path}: {fault.Message(err)}")
+				continue
+			}
+			mut inode = 0
+			let (ino, _, idErr) = local.RootID(root + "/" + p.Path)
+			if idErr == nil {
+				inode = ino
+			}
+			st.Base[p.Key] = Base{Path: p.Path, Id: p.R.Id, Kind: proto.KindDir, Hash: p.R.Hash, Size: 0, Mtime: 0, Inode: inode, Blocks: []str{}}
+			continue
+		}
+		download(root, mut c, mut st, p, s, mut meter) catch err {
+			rep.Errors = append(rep.Errors, "{p.Path}: downloading: {fault.Message(err)}")
+			meter.pendingDown = max(meter.pendingDown - 1, 0)
+			continue
+		}
+		meter.pendingDown = max(meter.pendingDown - 1, 0)
+		rep.Downloaded += 1
+		activity(root, "↓", p.Path)
+	}
+	mut i = len(plans) - 1
+	for i >= 0 {
+		let p = plans[i]
+		i -= 1
+		if p.Do != "pull-delete" {
+			continue
+		}
+		let full = root + "/" + p.Path
+		if p.L.Kind == proto.KindDir {
+			if removeDir(full) {
+				delete(st.Base, p.Key)
+				rep.DeletedHere += 1
+				activity(root, "×", p.Path)
+			}
+			continue
+		}
+		// only a file still as it was scanned: an edit made since wins
+		let info = quarry.Lstat(full) catch _ {
+			delete(st.Base, p.Key)
+			continue
+		}
+		if info.Size != p.L.Size || info.Mtime != p.L.Mtime {
+			continue
+		}
+		toTrash(full)
+		delete(st.Base, p.Key)
+		rep.DeletedHere += 1
+		activity(root, "×", p.Path)
+	}
+}
+
+// download fetches a file's blocks into a temporary file, checks them, and renames it into place.
+fn download(root str, c mut api.Client, st mut State, p Plan, s settings.Settings, meter mut Meter) ! {
+	let tmpDir = Dir(root) + "/tmp"
+	try quarry.MkdirAll(tmpDir)
+	let tmp = tmpDir + "/" + seal.Hex(seal.RandomBytes(8)) + ".tinbox-tmp"
+	try quarry.WriteFile(tmp, "")
+	let want = try proto.FileHash(p.R.Blocks)
+	if want != p.R.Hash {
+		fail "the server's block list does not match the file's hash"
+	}
+	mut unique = []str{}
+	mut seen = map[str]bool{}
+	for b in p.R.Blocks {
+		if !seen[b] {
+			seen[b] = true
+			unique = append(unique, b)
+		}
+	}
+	mut urls = map[str]str{}
+	mut start = 0
+	for start < len(unique) {
+		let end = min(start + 1000, len(unique))
+		let got = try api.URLs(mut c, st.Team, unique[start:end])
+		for h, u in got {
+			urls[h] = u
+		}
+		start = end
+	}
+	mut done = 0
+	meter.start("downloading", p.Path, p.R.Size)
+	for b in p.R.Blocks {
+		let u = urls[b]
+		if len(u) == 0 {
+			fail "the server has no block {b}"
+		}
+		let t0 = tide.Now()
+		let data = try api.Download(mut c, u)
+		if proto.BlockHash(data) != b {
+			fail "a block came back damaged"
+		}
+		try quarry.AppendFile(tmp, data)
+		done += len(data)
+		meter.add(len(data))
+		if s.DownloadLimit > 0 {
+			let wantNs = len(data) * tide.Second / s.DownloadLimit
+			let took = tide.Since(t0)
+			if took < wantNs {
+				tide.Sleep(wantNs - took)
+			}
+		}
+	}
+	if done != p.R.Size {
+		fail "got {done} bytes of {p.R.Size}"
+	}
+	if p.R.Kind == proto.KindExec {
+		try quarry.Chmod(tmp, 0o755)
+	} else {
+		try quarry.Chmod(tmp, 0o644)
+	}
+	let full = root + "/" + p.Path
+	// the file here must still be as it was scanned (or still absent): an edit made meanwhile wins
+	if p.HasL {
+		let info = quarry.Lstat(full) catch _ {
+			quarry.Remove(tmp) catch _ {
+			}
+			fail "it was removed meanwhile"
+		}
+		if info.Size != p.L.Size || info.Mtime != p.L.Mtime {
+			try quarry.Remove(tmp)
+			fail "it changed meanwhile; the next sync takes care of it"
+		}
+	} else if quarry.Exists(full) {
+		try quarry.Remove(tmp)
+		fail "a file appeared there meanwhile; the next sync takes care of it"
+	}
+	let parent = local.Parent(p.Path)
+	if len(parent) > 0 {
+		try quarry.MkdirAll(root + "/" + parent)
+	}
+	try quarry.Rename(tmp, full)
+	let info = try quarry.Lstat(full)
+	let wrote = local.Entry{Path: p.Path, Kind: p.R.Kind, Size: info.Size, Mtime: info.Mtime, Inode: info.Inode, Hash: p.R.Hash, Blocks: p.R.Blocks, Over: false}
+	st.Base[p.Key] = baseOf(wrote, p.R, tide.Wall())
+}
+
+// toTrash moves a file to the user's Trash, or removes it when it cannot be moved there.
+fn toTrash(full str) {
+	let trash = quarry.Getenv("HOME") + "/.Trash"
+	if quarry.IsDir(trash) {
+		let name = local.Base(full)
+		mut dest = trash + "/" + name
+		if quarry.Exists(dest) {
+			dest = trash + "/" + name + " " + say.Str(tide.Wall() / tide.Second)
+		}
+		let moved = quarry.Rename(full, dest)
+		if moved == nil {
+			return
+		}
+	}
+	quarry.Remove(full) catch _ {
+	}
+}
+
+// removeDir removes a folder that holds nothing but files every folder ignores; it reports whether it is gone.
+fn removeDir(full str) bool {
+	let entries = quarry.ReadDirEntries(full) catch _ {
+		return !quarry.Exists(full)
+	}
+	let rules = local.LoadRules("/nonexistent")
+	for e in entries {
+		if !rules.Ignored(e.Name, e.Name) {
+			return false
+		}
+	}
+	for e in entries {
+		quarry.RemoveAll(full + "/" + e.Name) catch _ {
+		}
+	}
+	let gone = quarry.Remove(full)
+	return gone == nil
+}

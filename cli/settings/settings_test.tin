@@ -1,0 +1,34 @@
+package settings
+
+import "crucible"
+
+fn TestSizes(t mut crucible.T) {
+	let a = ParseSize("2MB") catch _ { -1 }
+	crucible.Equal(mut t, "2MB", a, 2097152)
+	let b = ParseSize("500 KB") catch _ { -1 }
+	crucible.Equal(mut t, "500 KB", b, 512000)
+	let c = ParseSize("0") catch _ { -1 }
+	crucible.Equal(mut t, "no limit", c, 0)
+	let (_, bad) = ParseSize("lots")
+	t.HasFault("words", bad)
+}
+
+fn TestRates(t mut crucible.T) {
+	let a = ParseRate("50kbps") catch _ { -1 }
+	crucible.Equal(mut t, "50kbps", a, 6250)
+	let b = ParseRate("50KB/s") catch _ { -1 }
+	crucible.Equal(mut t, "50KB/s", b, 51200)
+	let c = ParseRate("1MB/s") catch _ { -1 }
+	crucible.Equal(mut t, "1MB/s", c, 1048576)
+	let d = ParseRate("2mbps") catch _ { -1 }
+	crucible.Equal(mut t, "2mbps", d, 250000)
+	let (_, bad) = ParseRate("50")
+	t.HasFault("no unit", bad)
+}
+
+fn TestInterval(t mut crucible.T) {
+	let (_, fast) = ParseInterval("100ms")
+	t.HasFault("too often", fast)
+	let ok = ParseInterval("5s") catch _ { 0 }
+	t.True("5s", ok > 0)
+}

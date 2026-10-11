@@ -1,0 +1,414 @@
+package api
+
+import "../../proto"
+import "../home"
+import "argo"
+import "constraints"
+import "fault"
+import "seal"
+import "tide"
+import "twine"
+import "wire"
+
+// The tinbox server's API, signed as this Mac: every request carries a Tinbox-Signature over its method, path, a
+// nonce and its body's hash (design/backend.md, "Signing"). A nonce is good for a minute, so one is reused for many
+// requests and fetched again on NonceExpired.
+
+// CallTimeout bounds one request.
+const CallTimeout = 120 * tide.Second
+
+// NonceReuse is how long a nonce is reused before a fresh one is fetched.
+const NonceReuse = 40 * tide.Second
+
+// Client talks to one server as one device ("new" for a key not registered yet).
+type Client struct {
+	Base    str
+	Device  str
+	LastMs  i64
+	seed    []u8
+	nonce   str
+	nonceAt i64
+}
+
+// New is a client of base signing as device with the ed25519 seed.
+fn New(base str, device str, seed []u8) Client {
+	return Client{Base: twine.TrimRight(base, "/"), Device: device, LastMs: 0, seed: seed, nonce: "", nonceAt: 0}
+}
+
+// FromCredentials is a client for this Mac's sign-in.
+fn FromCredentials(c home.Credentials) !Client {
+	let seed = try seal.B64Decode(c.Seed) wrap "the stored key"
+	return New(c.Server, "{c.Device}", seed)
+}
+
+// NewSeed is a fresh ed25519 seed for a new key.
+fn NewSeed() []u8 {
+	return seal.RandomBytes(32)
+}
+
+// PublicKey is the base64 public key of a seed.
+fn PublicKey(seed []u8) !str {
+	let pub = try seal.Ed25519PublicKey(seed)
+	return seal.B64(pub)
+}
+
+// ErrorBody and ErrorOut are the server's error answer.
+type ErrorBody struct {
+	@json("code") Code str
+	@json("message") Message str
+}
+
+type ErrorOut struct {
+	@json("error") Error ErrorBody
+	@json("nonce") Nonce str
+}
+
+// NonceOut is GET /v1/nonce.
+type NonceOut struct {
+	@json("nonce") Nonce str
+	@json("life") Life i64
+}
+
+fn options() wire.Options {
+	return wire.Options{Timeout: CallTimeout, MaxBody: 0, TLS: nil, MaxIdle: 0, NoH2: false, H2C: false, Trace: nil}
+}
+
+fn (c mut Client) fetchNonce() !str {
+	let r = try wire.DoWith("GET", c.Base + "/v1/nonce", []str{}, "", options()) wrap "reaching {c.Base}"
+	if r.Status != 200 {
+		fail "{c.Base} answered {r.Status} for a nonce: is it a tinbox server?"
+	}
+	mut n = NonceOut{Nonce: "", Life: 0}
+	try argo.Get(r.Body, mut n) wrap "{c.Base} is not a tinbox server"
+	c.nonce = n.Nonce
+	c.nonceAt = tide.Now()
+	return n.Nonce
+}
+
+fn (c mut Client) currentNonce() !str {
+	if len(c.nonce) > 0 && tide.Since(c.nonceAt) < NonceReuse {
+		return c.nonce
+	}
+	return try c.fetchNonce()
+}
+
+fn (c mut Client) send(method str, path str, body str, ctype str, nonce str) !wire.Resp {
+	let text = []u8(proto.SigningText(method, path, nonce, seal.Hex(seal.Sha256(body))))
+	let sig = try seal.SignEd25519(c.seed, text)
+	let headers = []str{proto.SignatureHeader, proto.Signature(c.Device, nonce, sig), "Content-Type", ctype}
+	let started = tide.Now()
+	let r = try wire.DoWith(method, c.Base + path, headers, body, options()) wrap "reaching {c.Base}"
+	c.LastMs = tide.Since(started) / tide.Millisecond
+	return r
+}
+
+// Raw sends one signed request; a NonceExpired refusal is retried once with the fresh nonce it carries.
+fn (c mut Client) Raw(method str, path str, body str, ctype str) !wire.Resp {
+	let n = try c.currentNonce()
+	let r = try c.send(method, path, body, ctype, n)
+	if r.Status != 401 {
+		return r
+	}
+	mut e = ErrorOut{Error: ErrorBody{Code: "", Message: ""}, Nonce: ""}
+	argo.Get(r.Body, mut e) catch _ {
+		return r
+	}
+	if e.Error.Code != "NonceExpired" || len(e.Nonce) == 0 {
+		return r
+	}
+	c.nonce = e.Nonce
+	c.nonceAt = tide.Now()
+	return try c.send(method, path, body, ctype, e.Nonce)
+}
+
+// Check fails with the server's error when r is not a success.
+fn Check(r wire.Resp) ! {
+	if r.Status >= 200 && r.Status < 300 {
+		return
+	}
+	mut e = ErrorOut{Error: ErrorBody{Code: "", Message: ""}, Nonce: ""}
+	argo.Get(r.Body, mut e) catch _ {
+		if r.Status == 404 {
+			fail "the server does not know this request: it may need an update (redeploy the tinbox server)"
+		}
+		fail "the server answered {r.Status}: {twine.TrimSpace(r.Body)}"
+	}
+	let msg = e.Error.Message
+	let code = e.Error.Code
+	if code == "Unauthorized" {
+		fail fault.Wrap(proto.ErrUnauthorized, msg)
+	}
+	if code == "NonceExpired" {
+		fail fault.Wrap(proto.ErrNonce, msg)
+	}
+	if code == "Forbidden" {
+		fail fault.Wrap(proto.ErrForbidden, msg)
+	}
+	if code == "NotFound" {
+		fail fault.Wrap(proto.ErrNotFound, msg)
+	}
+	if code == "Conflict" {
+		fail fault.Wrap(proto.ErrConflict, msg)
+	}
+	if code == "BadRequest" {
+		fail fault.Wrap(proto.ErrInvalid, msg)
+	}
+	if code == "TooLarge" {
+		fail fault.Wrap(proto.ErrTooLarge, msg)
+	}
+	if code == "BadBlock" {
+		fail fault.Wrap(proto.ErrBadBlock, msg)
+	}
+	if code == "QuotaExceeded" {
+		fail fault.Wrap(proto.ErrQuota, msg)
+	}
+	fail "the server answered {r.Status} {code}: {msg}"
+}
+
+// Call sends a JSON request and reads the JSON answer into out.
+fn Call[T constraints.Any](c mut Client, method str, path str, body str, out mut T) ! {
+	let r = try c.Raw(method, path, body, "application/json")
+	try Check(r)
+	try argo.Get(r.Body, mut out) wrap "reading the answer to {method} {path}"
+}
+
+// Encode is v as JSON.
+fn Encode[T constraints.Any](v T) str {
+	mut b = make([]u8, 0, 256)
+	argo.Put(mut b, v)
+	return str(b)
+}
+
+// Fetch downloads a URL with no signature (a presigned block URL).
+fn Fetch(url str) !str {
+	let r = try wire.DoWith("GET", url, []str{}, "", options()) wrap "downloading a block"
+	if r.Status != 200 {
+		fail "downloading a block: {r.Status}"
+	}
+	return r.Body
+}
+
+// ---- the answers ----
+
+type UserOut struct {
+	@json("id") Id i64
+	@json("email") Email str
+	@json("name") Name str
+}
+
+type DeviceOut struct {
+	@json("id") Id i64
+	@json("name") Name str
+	@json("created") Created i64
+	@json("last_seen") LastSeen i64
+	@json("current") Current bool
+}
+
+type TeamOut struct {
+	@json("id") Id i64
+	@json("name") Name str
+	@json("role") Role str
+	@json("root") Root i64
+}
+
+type MeOut struct {
+	@json("user") User UserOut
+	@json("device") Device i64
+	@json("devices") Devices []DeviceOut
+	@json("teams") Teams []TeamOut
+}
+
+type Joined struct {
+	@json("user") User UserOut
+	@json("device") Device i64
+	@json("team") Team i64
+	@json("role") Role str
+}
+
+type CodeOut struct {
+	@json("code") Code str
+	@json("expires_in") ExpiresIn i64
+}
+
+type MemberOut struct {
+	@json("user") User UserOut
+	@json("role") Role str
+}
+
+type MembersOut struct {
+	@json("members") Members []MemberOut
+}
+
+type ApprovedOut struct {
+	@json("device_name") DeviceName str
+}
+
+type OkOut struct {
+	@json("ok") Ok bool
+}
+
+type MissingOut struct {
+	@json("missing") Missing []str
+}
+
+type URLsOut struct {
+	@json("urls") Urls map[str]str
+	@json("expires_in") ExpiresIn i64
+}
+
+type BlockOut struct {
+	@json("hash") Hash str
+	@json("size") Size i64
+}
+
+type VersionOut struct {
+	@json("rev") Rev i64
+	@json("kind") Kind i64
+	@json("hash") Hash str
+	@json("size") Size i64
+	@json("device") Device i64
+	@json("at") At i64
+}
+
+type VersionsOut struct {
+	@json("versions") Versions []VersionOut
+}
+
+type NodesOut struct {
+	@json("nodes") Nodes []proto.NodeOut
+}
+
+type RewindOut struct {
+	@json("changed") Changed i64
+	@json("seq") Seq i64
+	@json("root_hash") RootHash str
+}
+
+// ---- requests ----
+
+// Me is the signed-in user, their Macs and teams.
+fn Me(c mut Client) !MeOut {
+	mut o = MeOut{User: UserOut{Id: 0, Email: "", Name: ""}, Device: 0, Devices: []DeviceOut{}, Teams: []TeamOut{}}
+	try Call(mut c, "GET", "/v1/me", "", mut o)
+	return o
+}
+
+// Head is a team folder's head.
+fn Head(c mut Client, team i64) !proto.HeadOut {
+	mut h = proto.HeadOut{Seq: 0, Epoch: "", Root: 0, RootHash: "", Floor: 0}
+	try Call(mut c, "GET", "/v1/teams/{team}/head", "", mut h)
+	return h
+}
+
+// Delta is the journal after cursor.
+fn Delta(c mut Client, team i64, cursor i64) !proto.DeltaOut {
+	mut d = proto.DeltaOut{Entries: []proto.Entry{}, Cursor: 0, More: false, Reset: false, Epoch: "", Head: 0}
+	try Call(mut c, "GET", "/v1/teams/{team}/delta?cursor={cursor}", "", mut d)
+	return d
+}
+
+// Snapshot is a page of live nodes after an id.
+fn Snapshot(c mut Client, team i64, after i64) !proto.SnapshotOut {
+	mut s = proto.SnapshotOut{Nodes: []proto.NodeOut{}, Next: 0, More: false, Seq: 0}
+	try Call(mut c, "GET", "/v1/teams/{team}/snapshot?after={after}", "", mut s)
+	return s
+}
+
+// HashesIn lists block hashes.
+type HashesIn struct {
+	@json("hashes") Hashes []str
+}
+
+fn copied(xs []str) []str {
+	mut out = make([]str, 0, len(xs))
+	for x in xs {
+		out = append(out, x)
+	}
+	return out
+}
+
+// Missing is which blocks the team lacks.
+fn Missing(c mut Client, team i64, hashes []str) ![]str {
+	mut o = MissingOut{Missing: []str{}}
+	try Call(mut c, "POST", "/v1/teams/{team}/blocks/missing", Encode(HashesIn{Hashes: copied(hashes)}), mut o)
+	return o.Missing
+}
+
+// URLs is where each block downloads from: absolute URLs, or the server's own paths.
+fn URLs(c mut Client, team i64, hashes []str) !map[str]str {
+	mut o = URLsOut{Urls: map[str]str{}, ExpiresIn: 0}
+	try Call(mut c, "POST", "/v1/teams/{team}/blocks/urls", Encode(HashesIn{Hashes: copied(hashes)}), mut o)
+	return o.Urls
+}
+
+// Download is one block from a URL URLs gave.
+fn Download(c mut Client, url str) !str {
+	if twine.HasPrefix(url, "/") || twine.HasPrefix(url, c.Base + "/") {
+		let path = twine.TrimPrefix(url, c.Base)
+		let r = try c.Raw("GET", path, "", "application/json")
+		try Check(r)
+		return r.Body
+	}
+	return try Fetch(url)
+}
+
+// PutBlock uploads one whole block.
+fn PutBlock(c mut Client, team i64, hash str, data str) ! {
+	let r = try c.Raw("PUT", "/v1/teams/{team}/blocks/{hash}", data, "application/octet-stream")
+	try Check(r)
+}
+
+// PutPart uploads one part of a block sent in parts.
+fn PutPart(c mut Client, team i64, hash str, part i64, data str) ! {
+	let r = try c.Raw("PUT", "/v1/teams/{team}/uploads/{hash}/{part}", data, "application/octet-stream")
+	try Check(r)
+}
+
+// PartsIn completes an upload in parts.
+type PartsIn struct {
+	@json("parts") Parts i64
+}
+
+// CompleteUpload joins the parts of a block's upload.
+fn CompleteUpload(c mut Client, team i64, hash str, parts i64) ! {
+	mut o = BlockOut{Hash: "", Size: 0}
+	try Call(mut c, "POST", "/v1/teams/{team}/uploads/{hash}/complete", Encode(PartsIn{Parts: parts}), mut o)
+}
+
+// Op is one change of a commit, as the client writes it: proto.Op's members without the server's bounds.
+type Op struct {
+	@json("op_id") OpId str
+	@json("op") Op str
+	@json("node") Node i64
+	@json("parent") Parent i64
+	@json("parent_op") ParentOp str
+	@json("name") Name str
+	@json("kind") Kind i64
+	@json("blocks") Blocks []str
+	@json("mtime_ns") MtimeNs i64
+	@json("base_rev") BaseRev i64
+	@json("base_place_rev") BasePlaceRev i64
+	@json("base_hash") BaseHash str
+}
+
+// CommitIn is a commit's body.
+type CommitIn struct {
+	@json("ops") Ops []Op
+	@json("confirmed") Confirmed bool
+}
+
+// NewOp is an op of kind with a fresh op_id and every other member empty.
+fn NewOp(kind str) Op {
+	return Op{OpId: seal.Hex(seal.RandomBytes(12)), Op: kind, Node: 0, Parent: 0, ParentOp: "", Name: "", Kind: 0, Blocks: []str{}, MtimeNs: 0, BaseRev: 0, BasePlaceRev: 0, BaseHash: ""}
+}
+
+// Commit sends a batch of changes.
+fn Commit(c mut Client, team i64, ops []Op, confirmed bool) !proto.CommitOut {
+	mut o = proto.CommitOut{Results: []proto.Result{}, Seq: 0, RootHash: ""}
+	mut batch = make([]Op, 0, len(ops))
+	for op in ops {
+		batch = append(batch, op)
+	}
+	try Call(mut c, "POST", "/v1/teams/{team}/commit", Encode(CommitIn{Ops: batch, Confirmed: confirmed}), mut o)
+	return o
+}

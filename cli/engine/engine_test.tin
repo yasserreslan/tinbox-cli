@@ -1,0 +1,37 @@
+package engine
+
+import "../../proto"
+import "../local"
+import "crucible"
+
+fn plan(hasL bool, lh str, hasR bool, rh str, hasB bool, bh str) str {
+	mut p = Plan{Key: "a", Path: "a", Do: "", L: emptyEntry(), R: emptyNode(), B: emptyBase(), HasL: hasL, HasR: hasR, HasB: hasB}
+	p.L = local.Entry{Path: "a", Kind: proto.KindFile, Size: 1, Mtime: 1, Inode: 1, Hash: lh, Blocks: []str{}, Over: false}
+	p.R = RNode{Id: 5, Parent: 1, Name: "a", Kind: proto.KindFile, Hash: rh, Size: 1, Rev: 1, PlaceRev: 1, Blocks: []str{}}
+	p.B = Base{Path: "a", Id: 5, Kind: proto.KindFile, Hash: bh, Size: 1, Mtime: 1, Inode: 1, Blocks: []str{}}
+	decide(mut p)
+	return p.Do
+}
+
+fn TestDecide(t mut crucible.T) {
+	crucible.Equal(mut t, "in sync", plan(true, "x", true, "x", true, "x"), "none")
+	crucible.Equal(mut t, "edited here", plan(true, "y", true, "x", true, "x"), "push-modify")
+	crucible.Equal(mut t, "edited there", plan(true, "x", true, "y", true, "x"), "pull-modify")
+	crucible.Equal(mut t, "new here", plan(true, "x", false, "", false, ""), "push-create")
+	crucible.Equal(mut t, "new there", plan(false, "", true, "x", false, ""), "pull-create")
+	crucible.Equal(mut t, "deleted here", plan(false, "", true, "x", true, "x"), "push-delete")
+	crucible.Equal(mut t, "deleted there", plan(true, "x", false, "", true, "x"), "pull-delete")
+	crucible.Equal(mut t, "both edited alike", plan(true, "y", true, "y", true, "x"), "adopt")
+	crucible.Equal(mut t, "both edited apart", plan(true, "y", true, "z", true, "x"), "conflict")
+	crucible.Equal(mut t, "deleted here, edited there: the edit wins", plan(false, "", true, "z", true, "x"), "pull-create")
+	crucible.Equal(mut t, "edited here, deleted there: the edit wins", plan(true, "y", false, "", true, "x"), "push-create")
+	crucible.Equal(mut t, "no base, both the same", plan(true, "x", true, "x", false, ""), "adopt")
+	crucible.Equal(mut t, "no base, different: never a delete", plan(true, "x", true, "y", false, ""), "conflict")
+	crucible.Equal(mut t, "gone on both sides", plan(false, "", false, "", true, "x"), "drop")
+}
+
+fn TestConflictName(t mut crucible.T) {
+	let n = conflictName("Docs/notes.md", "MacBook Air")
+	t.True("beside the file", len(n) > len("Docs/notes (conflicted copy, MacBook Air, ).md"))
+	t.True("keeps the extension", n[len(n) - 3:] == ".md")
+}

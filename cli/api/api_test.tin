@@ -1,0 +1,11 @@
+package api
+
+import "crucible"
+
+fn TestKeys(t mut crucible.T) {
+	let seed = NewSeed()
+	let pub = PublicKey(seed) catch _ { "" }
+	crucible.Equal(mut t, "a base64 ed25519 key", len(pub), 44)
+	let c = New("https://example.org/", "7", seed)
+	crucible.Equal(mut t, "base without slash", c.Base, "https://example.org")
+}

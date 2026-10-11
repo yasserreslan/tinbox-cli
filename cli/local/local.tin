@@ -1,0 +1,287 @@
+package local
+
+import "../../proto"
+import "fault"
+import "quarry"
+import "twine"
+
+// What is on this Mac's disk under a linked folder: every file and folder that is not ignored, with each file's hash.
+// A file whose size, modification time and inode are what the cache recorded keeps its cached hash and is not read
+// again; the rest are read in 4 MiB blocks, the block size every tinbox client hashes with.
+
+// Entry is one file or folder under the root; Path is relative, with "/" between names.
+type Entry struct {
+	Path   str
+	Kind   i64
+	Size   i64
+	Mtime  i64
+	Inode  i64
+	Hash   str
+	Blocks []str
+	Over   bool
+}
+
+// Cached is what the last sync knew of a file, so an unchanged one is not hashed again.
+type Cached struct {
+	Size   i64
+	Mtime  i64
+	Inode  i64
+	Hash   str
+	Blocks []str
+}
+
+// Rules is what a folder ignores: the Mac's own files, .tinbox, and the patterns of its .tinboxignore.
+type Rules struct {
+	patterns []str
+}
+
+// defaults is what every folder ignores.
+fn defaults() []str {
+	return []str{".tinbox", ".DS_Store", "._*", ".Trashes", ".fseventsd", ".Spotlight-V100", ".TemporaryItems", ".DocumentRevisions-V100", "Icon\r", "*.tinbox-tmp", ".~lock.*#", "~$*"}
+}
+
+// LoadRules is the folder's rules: the defaults and each line of .tinboxignore that is not blank or a # comment.
+fn LoadRules(root str) Rules {
+	mut ps = defaults()
+	let p = root + "/.tinboxignore"
+	if quarry.Exists(p) {
+		let text = quarry.ReadFileBound(p, 1048576) catch _ {
+			""
+		}
+		for line in twine.Split(text, "\n") {
+			let t = twine.TrimSpace(line)
+			if len(t) > 0 && t[0] != '#' {
+				ps = append(ps, twine.TrimRight(t, "/"))
+			}
+		}
+	}
+	return Rules{patterns: ps}
+}
+
+// glob reports whether name matches pattern, where * is any run of characters and ? any one.
+fn glob(pattern str, name str) bool {
+	mut p = 0
+	mut n = 0
+	mut star = -1
+	mut mark = 0
+	for n < len(name) {
+		if p < len(pattern) && (pattern[p] == '?' || pattern[p] == name[n]) {
+			p += 1
+			n += 1
+		} else if p < len(pattern) && pattern[p] == '*' {
+			star = p
+			mark = n
+			p += 1
+		} else if star >= 0 {
+			p = star + 1
+			mark += 1
+			n = mark
+		} else {
+			return false
+		}
+	}
+	for p < len(pattern) && pattern[p] == '*' {
+		p += 1
+	}
+	return p == len(pattern)
+}
+
+// Ignored reports whether the entry at rel (with base name name) is ignored: a pattern with no slash matches any
+// base name, one with a slash matches the path from the root.
+fn (r Rules) Ignored(rel str, name str) bool {
+	for pat in r.patterns {
+		if twine.Contains(pat, "/") {
+			if glob(twine.TrimPrefix(pat, "/"), rel) {
+				return true
+			}
+		} else if glob(pat, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// HashFile reads a file in 4 MiB blocks and gives its hash and its block hashes.
+fn HashFile(path str, size i64) !(str, []str) {
+	mut blocks = []str{}
+	mut off = 0
+	for off < size {
+		let n = min(proto.BlockSize, size - off)
+		let data = try quarry.ReadAt(path, off, n)
+		if len(data) != n {
+			fail "{path} changed while it was read"
+		}
+		blocks = append(blocks, proto.BlockHash(data))
+		off += n
+	}
+	let h = try proto.FileHash(blocks)
+	return h, blocks
+}
+
+// ReadBlock is block i of a file.
+fn ReadBlock(path str, i i64, size i64) !str {
+	let off = i * proto.BlockSize
+	let n = min(proto.BlockSize, size - off)
+	return try quarry.ReadAt(path, off, n)
+}
+
+// Scan is every entry under root that rules do not ignore. Files larger than maxSize (when it is above 0) are listed
+// with Over set and no hash. Symlinks and special files are skipped.
+fn Scan(root str, rules Rules, cache map[str]Cached, maxSize i64) !map[str]Entry {
+	mut out = map[str]Entry{}
+	try walk(root, "", rules, cache, maxSize, mut out)
+	return out
+}
+
+fn walk(root str, rel str, rules Rules, cache map[str]Cached, maxSize i64, out mut map[str]Entry) ! {
+	mut dir = root
+	if len(rel) > 0 {
+		dir = root + "/" + rel
+	}
+	let entries = try quarry.ReadDirEntries(dir) wrap "reading {dir}"
+	for e in entries {
+		let name = e.Name
+		mut childRel = name
+		if len(rel) > 0 {
+			childRel = rel + "/" + name
+		}
+		if rules.Ignored(childRel, name) {
+			continue
+		}
+		let full = root + "/" + childRel
+		let info = quarry.Lstat(full) catch _ {
+			continue
+		}
+		let isDir = match info.Type {
+			Dir => true
+			_ => false
+		}
+		let isFile = match info.Type {
+			Regular => true
+			_ => false
+		}
+		if isDir {
+			out[childRel] = Entry{Path: childRel, Kind: proto.KindDir, Size: 0, Mtime: info.Mtime, Inode: info.Inode, Hash: "", Blocks: []str{}, Over: false}
+			try walk(root, childRel, rules, cache, maxSize, mut out)
+			continue
+		}
+		if !isFile {
+			continue
+		}
+		mut kind = proto.KindFile
+		if info.Perm & 0o100 != 0 {
+			kind = proto.KindExec
+		}
+		mut ent = Entry{Path: childRel, Kind: kind, Size: info.Size, Mtime: info.Mtime, Inode: info.Inode, Hash: "", Blocks: []str{}, Over: false}
+		if maxSize > 0 && info.Size > maxSize {
+			ent.Over = true
+			out[childRel] = ent
+			continue
+		}
+		let (c, known) = cache[childRel]
+		if known && c.Size == info.Size && c.Mtime == info.Mtime && c.Inode == info.Inode && c.Mtime != 0 {
+			ent.Hash = c.Hash
+			ent.Blocks = c.Blocks
+		} else {
+			let (h, blocks) = HashFile(full, info.Size) catch _ {
+				// a file that vanished or is being written is picked up by the next scan
+				continue
+			}
+			ent.Hash = h
+			ent.Blocks = blocks
+		}
+		out[childRel] = ent
+	}
+}
+
+// RootHash is the Merkle hash of the scanned tree, as the server computes it for the folder's root: files over the
+// size limit are left out, as they are not on the server.
+fn RootHash(entries map[str]Entry) !str {
+	mut dirs = []str{""}
+	for p, e in entries {
+		if e.Kind == proto.KindDir {
+			dirs = append(dirs, p)
+		}
+	}
+	// deepest folders first, so each folder's hash is known before its parent's
+	mut order = dirs
+	mut sorted = false
+	for !sorted {
+		sorted = true
+		for i in 1..len(order) {
+			if depth(order[i]) > depth(order[i - 1]) {
+				let t = order[i]
+				order[i] = order[i - 1]
+				order[i - 1] = t
+				sorted = false
+			}
+		}
+	}
+	mut hashes = map[str]str{}
+	for p, e in entries {
+		if e.Kind != proto.KindDir && !e.Over {
+			hashes[p] = e.Hash
+		}
+	}
+	for d in order {
+		mut cs = []proto.Child{}
+		for p, e in entries {
+			if parentOf(p) != d || e.Over {
+				continue
+			}
+			if e.Kind == proto.KindDir {
+				cs = append(cs, proto.Child{Name: baseOf(p), Kind: e.Kind, Hash: hashes[p]})
+			} else {
+				cs = append(cs, proto.Child{Name: baseOf(p), Kind: e.Kind, Hash: e.Hash})
+			}
+		}
+		hashes[d] = try proto.DirHash(cs)
+	}
+	return hashes[""]
+}
+
+fn depth(p str) i64 {
+	if len(p) == 0 {
+		return 0
+	}
+	return twine.Count(p, "/") + 1
+}
+
+// parentOf is the folder that holds p ("" for the root).
+fn parentOf(p str) str {
+	let i = twine.LastIndex(p, "/")
+	if i < 0 {
+		return ""
+	}
+	return p[0:i]
+}
+
+// baseOf is p's last name.
+fn baseOf(p str) str {
+	let i = twine.LastIndex(p, "/")
+	if i < 0 {
+		return p
+	}
+	return p[i + 1:]
+}
+
+// Parent and Base are parentOf and baseOf for other packages.
+fn Parent(p str) str {
+	return parentOf(p)
+}
+
+fn Base(p str) str {
+	return baseOf(p)
+}
+
+// ErrUnsafe is the fault of a folder that looks replaced: its root is gone or is another directory.
+let ErrUnsafe = fault("the folder looks replaced")
+
+// RootID is the inode and device of a folder's root, to notice an unmounted disk or a replaced folder.
+fn RootID(root str) !(i64, i64) {
+	let info = quarry.Stat(root) catch _ {
+		fail fault.Wrap(ErrUnsafe, "{root} is missing")
+		quarry.FileInfo{Type: quarry.FileType.Dir, Perm: 0, Size: 0, Mtime: 0, Ctime: 0, Inode: 0, Device: 0, Links: 0}
+	}
+	return info.Inode, info.Device
+}

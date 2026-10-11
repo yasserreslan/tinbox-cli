@@ -1,0 +1,92 @@
+package engine
+
+import "../home"
+import "argo"
+import "quarry"
+
+// A linked folder's sync state, in <folder>/.tinbox/state.json: the server's tree as this Mac last saw it (by node
+// id), the merge base (by path: what both sides last agreed on, and the stat each file had then), the journal
+// cursor and the epoch.
+
+// RNode is one node of the server's tree.
+type RNode struct {
+	@json("id") Id i64
+	@json("parent") Parent i64
+	@json("name") Name str
+	@json("kind") Kind i64
+	@json("hash") Hash str
+	@json("size") Size i64
+	@json("rev") Rev i64
+	@json("place_rev") PlaceRev i64
+	@json("blocks") Blocks []str
+}
+
+// Base is what this Mac and the server last agreed on for one path, keyed by the path in lower case.
+type Base struct {
+	@json("path") Path str
+	@json("id") Id i64
+	@json("kind") Kind i64
+	@json("hash") Hash str
+	@json("size") Size i64
+	@json("mtime") Mtime i64
+	@json("inode") Inode i64
+	@json("blocks") Blocks []str
+}
+
+// State is a linked folder's sync state.
+type State struct {
+	@json("version") Version i64
+	@json("server") Server str
+	@json("team") Team i64
+	@json("team_name") TeamName str
+	@json("cursor") Cursor i64
+	@json("epoch") Epoch str
+	@json("root") Root i64
+	@json("root_inode") RootInode i64
+	@json("root_device") RootDevice i64
+	@json("remote") Remote map[i64]RNode
+	@json("base") Base map[str]Base
+	@json("last_sync") LastSync i64
+	@json("last_error") LastError str
+	@json("verified") Verified bool
+	@json("files") Files i64
+	@json("bytes") Bytes i64
+	@json("skipped") Skipped []str
+	@json("conflicts") Conflicts []str
+	@json("waiting") Waiting i64
+}
+
+// Dir is a folder's .tinbox directory.
+fn Dir(root str) str {
+	return root + "/.tinbox"
+}
+
+fn statePath(root str) str {
+	return Dir(root) + "/state.json"
+}
+
+// Linked reports whether root has sync state.
+fn Linked(root str) bool {
+	return quarry.Exists(statePath(root))
+}
+
+// Fresh is the state of a folder just linked to a team.
+fn Fresh(server str, team i64, teamName str, inode i64, device i64) State {
+	return State{Version: 1, Server: server, Team: team, TeamName: teamName, Cursor: 0, Epoch: "", Root: 0, RootInode: inode, RootDevice: device, Remote: map[i64]RNode{}, Base: map[str]Base{}, LastSync: 0, LastError: "", Verified: false, Files: 0, Bytes: 0, Skipped: []str{}, Conflicts: []str{}, Waiting: 0}
+}
+
+// Load is a folder's state.
+fn Load(root str) !State {
+	let text = try quarry.ReadFileBound(statePath(root), 1073741824) wrap "reading {statePath(root)}"
+	mut st = Fresh("", 0, "", 0, 0)
+	try argo.Get(text, mut st) wrap "reading {statePath(root)}"
+	return st
+}
+
+// Save writes a folder's state, atomically.
+fn Save(root str, st State) ! {
+	try quarry.MkdirAll(Dir(root))
+	mut b = make([]u8, 0, 65536)
+	argo.Put(mut b, st)
+	try home.WriteAtomic(statePath(root), str(b), 0o600)
+}
