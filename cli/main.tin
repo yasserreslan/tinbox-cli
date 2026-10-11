@@ -24,7 +24,7 @@ import "wire"
 // tinbox: sync a folder on this Mac with a tinbox server (README.md). Commands sign in, link folders to teams, and
 // start or stop the background agent that keeps them in sync.
 
-const version = "0.1.2"
+const version = "0.1.3"
 
 const repo = "yasserreslan/tinbox-cli"
 

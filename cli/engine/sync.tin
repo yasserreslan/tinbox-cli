@@ -53,6 +53,9 @@ type Meter struct {
 	echoed      i64
 	pendingUp   i64
 	pendingDown i64
+	windowAt    i64
+	windowDone  i64
+	recent      i64
 }
 
 fn progressPath(root str) str {
@@ -65,17 +68,36 @@ fn (m mut Meter) start(phase str, path str, total i64) {
 	m.total = total
 	m.done = 0
 	m.began = tide.Now()
+	m.windowAt = m.began
+	m.windowDone = 0
+	m.recent = 0
 	m.flush(true)
 }
 
 fn (m mut Meter) add(n i64) {
 	m.done += n
+	m.window()
 	m.flush(m.total > 0 && m.done >= m.total)
 }
 
+// rate is the speed over the last few seconds (over the whole transfer until a window has passed), so a changed
+// limit shows at once.
 fn (m Meter) rate() i64 {
+	if m.recent > 0 {
+		return m.recent
+	}
 	let ms = max(tide.Since(m.began) / tide.Millisecond, 1)
 	return m.done * 1000 / ms
+}
+
+fn (m mut Meter) window() {
+	let t = tide.Now()
+	let span = t - m.windowAt
+	if span >= 3 * tide.Second {
+		m.recent = (m.done - m.windowDone) * 1000 / max(span / tide.Millisecond, 1)
+		m.windowAt = t
+		m.windowDone = m.done
+	}
 }
 
 fn (m mut Meter) flush(now bool) {
@@ -410,7 +432,7 @@ fn under(dir str, k str) bool {
 fn Cycle(root str, c mut api.Client, s settings.Settings, opts Options) !Report {
 	let device = opts.Device
 	let confirm = opts.Confirm
-	mut meter = Meter{root: root, echo: opts.Echo, phase: "", path: "", done: 0, total: 0, began: tide.Now(), last: 0, echoed: 0, pendingUp: 0, pendingDown: 0}
+	mut meter = Meter{root: root, echo: opts.Echo, phase: "", path: "", done: 0, total: 0, began: tide.Now(), last: 0, echoed: 0, pendingUp: 0, pendingDown: 0, windowAt: tide.Now(), windowDone: 0, recent: 0}
 	mut st = try Load(root)
 	mut rep = Report{Uploaded: 0, Downloaded: 0, DeletedHere: 0, DeletedThere: 0, Conflicts: []str{}, Skipped: []str{}, Waiting: 0, Verified: false, Files: 0, Bytes: 0, Errors: []str{}}
 	let (inode, dev) = try local.RootID(root)
@@ -722,24 +744,44 @@ fn pushFolders(c mut api.Client, st mut State, plans []Plan, ids mut map[str]i64
 	}
 }
 
-// upload sends one block, whole, or in parts that keep the upload speed under rate.
-fn upload(c mut api.Client, team i64, hash str, data str, rate i64, meter mut Meter) ! {
-	if rate <= 0 {
+// liveLimits is the folder's upload and download limits as the settings say now, so a change made with tinbox config
+// applies to a transfer already under way; when the settings cannot be read the limits stay as they were.
+fn liveLimits(root str, up i64, down i64) (i64, i64) {
+	let s = settings.Load(root) catch _ {
+		return up, down
+	}
+	return s.UploadLimit, s.DownloadLimit
+}
+
+// upload sends one block, whole, or in parts that keep the upload speed under the limit. The limit is read again
+// before every part (each about two seconds of data), so a new upload-limit takes effect within seconds.
+fn upload(c mut api.Client, team i64, hash str, data str, cap i64, meter mut Meter) ! {
+	let (first, _) = liveLimits(meter.root, cap, 0)
+	if first <= 0 {
 		try api.PutBlock(mut c, team, hash, data)
 		meter.add(len(data))
 		return
 	}
-	let part = max(4096, min(1048576, rate * 2))
+	mut rate = first
 	mut off = 0
 	mut n = 0
 	for off < len(data) {
+		let (now, _) = liveLimits(meter.root, rate, 0)
+		rate = now
+		// no limit any more: the rest goes in the largest parts, without pauses
+		let part = match rate > 0 {
+			true => max(4096, min(1048576, rate * 2))
+			false => 1048576
+		}
 		let end = min(off + part, len(data))
 		let started = tide.Now()
 		try api.PutPart(mut c, team, hash, n, data[off:end])
-		let want = (end - off) * tide.Second / rate
-		let took = tide.Since(started)
-		if took < want {
-			tide.Sleep(want - took)
+		if rate > 0 {
+			let want = (end - off) * tide.Second / rate
+			let took = tide.Since(started)
+			if took < want {
+				tide.Sleep(want - took)
+			}
 		}
 		// counted after the pause, so the speed shown is the speed kept
 		meter.add(end - off)
@@ -1016,8 +1058,9 @@ fn download(root str, c mut api.Client, st mut State, p Plan, s settings.Setting
 		try quarry.AppendFile(tmp, data)
 		done += len(data)
 		meter.add(len(data))
-		if s.DownloadLimit > 0 {
-			let wantNs = len(data) * tide.Second / s.DownloadLimit
+		let (_, downLimit) = liveLimits(root, s.UploadLimit, s.DownloadLimit)
+		if downLimit > 0 {
+			let wantNs = len(data) * tide.Second / downLimit
 			let took = tide.Since(t0)
 			if took < wantNs {
 				tide.Sleep(wantNs - took)

@@ -115,6 +115,18 @@ check "the upload speed cap holds (took $((t1 - t0)) s, at least 2)" '[ $((t1 - 
 B sync > /dev/null
 check "the capped upload arrives intact" 'cmp -s "$work/a/capped.bin" "$work/b/capped.bin"'
 check "settings show the folder's own limit" 'A config | grep -q "800kbps"'
+# changing the limit during an upload changes its speed: 400 KB at 80 kbps would take about 40 s
+A config set upload-limit 80kbps --folder > /dev/null
+head -c 409600 /dev/urandom > "$work/a/live.bin"
+t0=$(date +%s)
+A sync > /dev/null &
+spid2=$!
+sleep 4
+A config set upload-limit 0 --folder > /dev/null
+wait $spid2
+t1=$(date +%s)
+check "lifting the limit mid-upload speeds it up (took $((t1 - t0)) s, not about 40)" '[ $((t1 - t0)) -lt 15 ]'
+A config set upload-limit 800kbps --folder > /dev/null
 # everything agrees at the end
 A sync > /dev/null; B sync > /dev/null
 check "in the end both folders are the same" 'same'
