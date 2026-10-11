@@ -270,7 +270,13 @@ fn folderLines(f agent.FolderStatus, running bool, lim Limits, out mut []str) {
 	} else if f.Phase == "checking" {
 		out = append(out, Row(4, Cyan("◌ checking for changes"), Dim("last sync " + Ago(f.LastSync))))
 	} else if f.Phase == "error" {
-		out = append(out, Row(4, Red("✗ " + Clip(f.Error, 60)), Dim("tinbox log")))
+		for i, line in Wrap(firstError(f.Error), Width() - 8) {
+			if i == 0 {
+				out = append(out, "    " + Red("✗ " + line))
+			} else {
+				out = append(out, "      " + Red(line))
+			}
+		}
 	} else if !running {
 		out = append(out, Row(4, Dim("○ not syncing"), Dim("last sync " + Ago(f.LastSync))))
 	} else if f.Verified {
@@ -284,7 +290,7 @@ fn folderLines(f agent.FolderStatus, running bool, lim Limits, out mut []str) {
 	} else if len(f.Skipped) > 0 {
 		match_ = Dim("skipped files are not on the server")
 	}
-	out = append(out, Row(4, Count(f.Files) + " files · " + Size(f.Bytes), match_))
+	out = append(out, Row(4, Plural(f.Files, "file", "files") + " · " + Size(f.Bytes), match_))
 	if len(f.Skipped) > 0 {
 		mut n = "{len(f.Skipped)} files"
 		if len(f.Skipped) == 1 {
@@ -304,7 +310,17 @@ fn folderLines(f agent.FolderStatus, running bool, lim Limits, out mut []str) {
 		out = append(out, Row(4, Yellow("⚠ {f.Waiting} deletes held back"), Dim("tinbox sync --confirm-deletes")))
 	}
 	if f.Phase != "error" && len(f.Error) > 0 && f.Waiting == 0 {
-		out = append(out, Row(4, Yellow("⚠ " + Clip(f.Error, 60)), ""))
+		let more = twine.Count(f.Error, "; ")
+		for i, line in Wrap(firstError(f.Error), Width() - 8) {
+			if i == 0 {
+				out = append(out, "    " + Yellow("⚠ " + line))
+			} else {
+				out = append(out, "      " + Yellow(line))
+			}
+		}
+		if more > 0 {
+			out = append(out, "      " + Dim("and {more} more like it · tinbox sync shows them all"))
+		}
 	}
 }
 
@@ -350,6 +366,32 @@ fn Status(s agent.Status, running bool, creds ?home.Credentials, lim Limits, onl
 	out = append(out, Row(2, label("limits") + "upload " + lim.Upload + Dim(" · ") + "files up to " + lim.MaxFile + Dim(" · ") + "scan every " + lim.Scan, ""))
 	out = append(out, "")
 	return twine.Join(out, "\n")
+}
+
+// firstError is the first of several "; "-joined errors.
+fn firstError(e str) str {
+	let (first, _, _) = twine.Cut(e, "; ")
+	return first
+}
+
+// Wrap breaks s into lines of at most n columns, at spaces where it can.
+fn Wrap(s str, n i64) []str {
+	mut lines = []str{}
+	mut line = ""
+	for word in twine.Split(s, " ") {
+		if len(line) == 0 {
+			line = word
+		} else if glyph.RuneCount(line) + 1 + glyph.RuneCount(word) <= n {
+			line = line + " " + word
+		} else {
+			lines = append(lines, line)
+			line = word
+		}
+	}
+	if len(line) > 0 {
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 // Plural is "1 file" or "N files".
